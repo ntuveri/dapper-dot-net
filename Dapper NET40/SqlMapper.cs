@@ -569,7 +569,7 @@ namespace Dapper
         }
 
         internal const string LinqBinary = "System.Data.Linq.Binary";
-        internal static DbType LookupDbType(Type type, string name)
+        internal static DbType? LookupDbType(Type type, string name)
         {
             DbType dbType;
             var nullUnderlyingType = Nullable.GetUnderlyingType(type);
@@ -590,9 +590,7 @@ namespace Dapper
             {
                 return DynamicParameters.EnumerableMultiParameter;
             }
-
-
-            throw new NotSupportedException(string.Format("The member {0} of type {1} cannot be used as a parameter value", name, type));
+            return null;
         }
 
 
@@ -2387,7 +2385,9 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                     il.EmitCall(OpCodes.Callvirt, prop.PropertyType.GetMethod("AddParameter"), null); // stack is now [parameters]
                     continue;
                 }
-                DbType dbType = LookupDbType(prop.PropertyType, prop.Name);
+                DbType? dbType = LookupDbType(prop.PropertyType, prop.Name);
+                if (dbType == null) { continue; }
+                
                 if (dbType == DynamicParameters.EnumerableMultiParameter)
                 {
                     // this actually represents special handling for list types;

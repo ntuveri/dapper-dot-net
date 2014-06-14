@@ -2522,6 +2522,26 @@ end");
 
         }
 
+        public void TestProcedureParametersWithoutDbType()
+        {
+            Post p = new Post();
+            p.Id = 1;
+            p.Content = "abc";
+            connection.Execute(@"CREATE PROCEDURE #TestProcedureParametersWithoutDbType
+    @Id int,
+    @Content varchar(100)
+    AS 
+    BEGIN
+    SELECT @Id as Id, @Content as Content
+    END");
+
+            var ps = connection.Query<Post>("#TestProcedureParametersWithoutDbType", p, commandType: CommandType.StoredProcedure);
+            ps.IsNotNull();
+            ps.Count().IsEqualTo(1);
+            ps.Single().Id.IsEqualTo(1);
+            ps.Single().Content.IsEqualTo("abc");
+        }
+
         class TransactedConnection : IDbConnection
         {
             IDbConnection _conn;
