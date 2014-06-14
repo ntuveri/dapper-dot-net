@@ -558,7 +558,7 @@ namespace Dapper
             typeMap[typeof(DateTime?)] = DbType.DateTime;
             typeMap[typeof(DateTimeOffset?)] = DbType.DateTimeOffset;
             typeMap[typeof(TimeSpan?)] = DbType.Time;
-            typeMap[typeof(Object)] = DbType.Object;
+            typeMap[typeof(object)] = DbType.Object;
         }
         /// <summary>
         /// Configire the specified type to be mapped to a given db-type
@@ -1435,77 +1435,108 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
 
         private static Func<IDataReader, object>[] GenerateDeserializers(Type[] types, string splitOn, IDataReader reader)
         {
-            int current = 0;
-            var splits = splitOn.Split(',').ToArray();
-            var splitIndex = 0;
-
-            Func<Type, int> nextSplit = type =>
+            var deserializers = new List<Func<IDataReader, object>>();
+            var splits = splitOn.Split(',').Select(s => s.Trim()).ToArray();
+                bool isMultiSplit = splits.Length > 1;
+            if (types.First() == typeof(Object))
             {
-                var currentSplit = splits[splitIndex].Trim();
-                if (splits.Length > splitIndex + 1)
+                // we go left to right for dynamic multi-mapping so that the madness of TestMultiMappingVariations
+                // is supported
+                bool first = true;
+                int currentPos = 0;
+                int splitIdx = 0;
+                string currentSplit = splits[splitIdx];
+                foreach (var type in types)
                 {
-                    splitIndex++;
-                }
-
-                bool skipFirst = false;
-                int startingPos = current + 1;
-                // if our current type has the split, skip the first time you see it. 
-                if (type != typeof(Object))
-                {
-                    var props = DefaultTypeMap.GetSettableProps(type);
-                    var fields = DefaultTypeMap.GetSettableFields(type);
-
-                    foreach (var name in props.Select(p => p.Name).Concat(fields.Select(f => f.Name)))
-                    {
-                        if (string.Equals(name, currentSplit, StringComparison.OrdinalIgnoreCase))
-                        {
-                            skipFirst = true;
-                            startingPos = current;
-                            break;
-                        }
-                    }
-
-                }
-
-                int pos;
-                for (pos = startingPos; pos < reader.FieldCount; pos++)
-                {
-                    // some people like ID some id ... assuming case insensitive splits for now
-                    if (splitOn == "*")
+                    if (type == typeof(DontMap))
                     {
                         break;
                     }
-                    if (string.Equals(reader.GetName(pos), currentSplit, StringComparison.OrdinalIgnoreCase))
+
+                    int splitPoint = GetNextSplitDynamic(currentPos, currentSplit, reader);
+                    if (isMultiSplit && splitIdx < splits.Length - 1)
                     {
-                        if (skipFirst)
+                        currentSplit = splits[++splitIdx];
+                    }
+                    deserializers.Add((GetDeserializer(type, reader, currentPos, splitPoint - currentPos, !first)));
+                    currentPos = splitPoint;
+                    first = false;
+                }
+            }
+            else
+            {
+                // in this we go right to left through the data reader in order to cope with properties that are
+                // named the same as a subsequent primary key that we split on
+                int currentPos = reader.FieldCount;
+                int splitIdx = splits.Length - 1;
+                var currentSplit = splits[splitIdx];
+                for (var typeIdx = types.Length - 1; typeIdx >= 0; --typeIdx)
+                {
+                    var type = types[typeIdx];
+                    if (type == typeof (DontMap))
+                    {
+                        continue;
+                    }
+
+                    int splitPoint = 0;
+                    if (typeIdx > 0)
+                    {
+                        splitPoint = GetNextSplit(currentPos, currentSplit, reader);
+                        if (isMultiSplit && splitIdx > 0)
                         {
-                            skipFirst = false;
-                        }
-                        else
-                        {
-                            break;
+                            currentSplit = splits[--splitIdx];
                         }
                     }
-                }
-                current = pos;
-                return pos;
-            };
 
-            var deserializers = new List<Func<IDataReader, object>>();
-            int split = 0;
-            bool first = true;
-            foreach (var type in types)
+                    deserializers.Add((GetDeserializer(type, reader, splitPoint, currentPos - splitPoint, typeIdx > 0)));
+                    currentPos = splitPoint;
+                }
+
+                deserializers.Reverse();
+
+            }
+            return deserializers.ToArray();
+        }
+
+        private static int GetNextSplitDynamic(int startIdx, string splitOn, IDataReader reader)
+        {
+            if (startIdx == reader.FieldCount)
             {
-                if (type != typeof(DontMap))
+                throw new ArgumentException(MultiMapSplitExceptionMessage);
+            }
+
+            if (splitOn == "*")
+            {
+                return ++startIdx;
+            }
+
+            for (var i = startIdx + 1; i < reader.FieldCount; ++i)
+            {
+                if (string.Equals(splitOn, reader.GetName(i), StringComparison.OrdinalIgnoreCase))
                 {
-                    int next = nextSplit(type);
-                    deserializers.Add(GetDeserializer(type, reader, split, next - split, /* returnNullIfFirstMissing: */ !first));
-                    first = false;
-                    split = next;
+                    return i;
                 }
             }
 
-            return deserializers.ToArray();
+            return reader.FieldCount;
+        }
+
+        private static int GetNextSplit(int startIdx, string splitOn, IDataReader reader)
+        {
+            if (splitOn == "*")
+            {
+                return --startIdx;
+            }
+
+            for (var i = startIdx - 1; i > 0; --i)
+            {
+                if (string.Equals(splitOn, reader.GetName(i), StringComparison.OrdinalIgnoreCase))
+                {
+                    return i;
+                }
+            }
+
+            throw new ArgumentException(MultiMapSplitExceptionMessage);
         }
 
         private static CacheInfo GetCacheInfo(Identity identity, object exampleParameters)
@@ -2105,7 +2136,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                             else
                             {
                                 return "(SELECT " + variableName + " WHERE 1 = 0)";
-                            };
+                            }
                         });                        
                         var dummyParam = command.CreateParameter();
                         dummyParam.ParameterName = namePrefix;
@@ -2819,6 +2850,7 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
 
             ConstructorInfo specializedConstructor = null;
 
+            bool supportInitialize = false;
             if (type.IsValueType)
             {
                 il.Emit(OpCodes.Ldloca_S, (byte)1);
@@ -2843,6 +2875,12 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
                 {
                     il.Emit(OpCodes.Newobj, ctor);
                     il.Emit(OpCodes.Stloc_1);
+                    supportInitialize = typeof(ISupportInitialize).IsAssignableFrom(type);
+                    if(supportInitialize)
+                    {
+                        il.Emit(OpCodes.Ldloc_1);
+                        il.EmitCall(OpCodes.Callvirt, typeof(ISupportInitialize).GetMethod("BeginInit"), null);
+                    }
                 }
                 else
                     specializedConstructor = ctor;
@@ -3089,6 +3127,11 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
                     il.Emit(OpCodes.Newobj, specializedConstructor);
                 }
                 il.Emit(OpCodes.Stloc_1); // stack is empty
+                if (supportInitialize)
+                {
+                    il.Emit(OpCodes.Ldloc_1);
+                    il.EmitCall(OpCodes.Callvirt, typeof(ISupportInitialize).GetMethod("EndInit"), null);
+                }
             }
             il.MarkLabel(allDone);
             il.BeginCatchBlock(typeof(Exception)); // stack is Exception
@@ -3502,6 +3545,18 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
                 }
             }
         }
+
+        /// <summary>
+        /// Used to pass a DataTable as a TableValuedParameter
+        /// </summary>
+        public static ICustomQueryParameter AsTableValuedParameter(this DataTable table, string typeName
+#if !CSHARP30
+            = null
+#endif
+            )
+        {
+            return new TableValuedParameter(table, typeName);
+        }
     }
 
     /// <summary>
@@ -3779,6 +3834,43 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
         }
     }
 
+    /// <summary>
+    /// Used to pass a DataTable as a TableValuedParameter
+    /// </summary>
+    sealed partial class TableValuedParameter : Dapper.SqlMapper.ICustomQueryParameter
+    {
+        private readonly DataTable table;
+        private readonly string typeName;
+
+        /// <summary>
+        /// Create a new instance of TableValuedParameter
+        /// </summary>
+        public TableValuedParameter(DataTable table) : this(table, null) { }
+        /// <summary>
+        /// Create a new instance of TableValuedParameter
+        /// </summary>
+        public TableValuedParameter(DataTable table, string typeName)
+        {
+            this.table = table;
+            this.typeName = typeName;
+        }
+        void SqlMapper.ICustomQueryParameter.AddParameter(IDbCommand command, string name)
+        {
+            var param = command.CreateParameter();
+            param.ParameterName = name;
+            param.Value = (object)table ?? DBNull.Value;
+            if (!string.IsNullOrEmpty(typeName))
+            {
+                var sqlParam = param as System.Data.SqlClient.SqlParameter;
+                if (sqlParam != null)
+                {
+                    sqlParam.TypeName = typeName;
+                    sqlParam.SqlDbType = SqlDbType.Structured;
+                }
+            }
+            command.Parameters.Add(param);
+        }
+    }
     /// <summary>
     /// This class represents a SQL string, it can be used if you need to denote your parameter is a Char vs VarChar vs nVarChar vs nChar
     /// </summary>
@@ -4170,6 +4262,7 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
 
     }
 
+    
     public partial class SimpleMemberMap
     {
 

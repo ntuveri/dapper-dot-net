@@ -1284,6 +1284,38 @@ end");
 
         }
 
+        public void TestMultiMappingWithNonReturnedProperty()
+        {
+            var sql = @"select 
+                            1 as PostId, 'Title' as Title,
+                            2 as BlogId, 'Blog' as Title";
+            var postWithBlog = connection.Query<Post_DupeProp, Blog_DupeProp, Post_DupeProp>(sql,
+                (p, b) =>
+                {
+                    p.Blog = b;
+                    return p;
+                }, splitOn: "BlogId").First();
+
+            postWithBlog.PostId.IsEqualTo(1);
+            postWithBlog.Title.IsEqualTo("Title");
+            postWithBlog.Blog.BlogId.IsEqualTo(2);
+            postWithBlog.Blog.Title.IsEqualTo("Blog");
+        }
+
+        class Post_DupeProp
+        {
+            public int PostId { get; set; }
+            public string Title { get; set; }
+            public int BlogId { get; set; }
+            public Blog_DupeProp Blog { get; set; } 
+        }
+
+        class Blog_DupeProp
+        {
+            public int BlogId { get; set; }
+            public string Title { get; set; }
+        }
+
         public void TestFastExpandoSupportsIDictionary()
         {
             var row = connection.Query("select 1 A, 'two' B").First() as IDictionary<string, object>;
@@ -2840,6 +2872,53 @@ option (optimize for (@vals unKnoWn))";
             public double? B { get; set; }
             public decimal C { get; set; }
             public decimal? D { get; set; }
+        }
+
+        public void DataTableParameters()
+        {
+            try { connection.Execute("drop type MyTVPType"); } catch { }
+            connection.Execute("create type MyTVPType as table (id int)");
+            connection.Execute("create proc #DataTableParameters @ids MyTVPType readonly as select count(1) from @ids");
+
+            var table = new DataTable { Columns = { { "id", typeof(int) } }, Rows = { { 1 }, { 2 }, { 3 } } };
+
+            int count = connection.Query<int>("#DataTableParameters", new { ids = table.AsTableValuedParameter() }, commandType: CommandType.StoredProcedure).First();
+            count.IsEqualTo(3);
+
+            count = connection.Query<int>("select count(1) from @ids", new { ids = table.AsTableValuedParameter("MyTVPType") }).First();
+            count.IsEqualTo(3);
+
+            try
+            {
+                connection.Query<int>("select count(1) from @ids", new { ids = table.AsTableValuedParameter() }).First();
+                throw new InvalidOperationException();
+            } catch(Exception ex)
+            {
+                ex.Message.Equals("The table type parameter 'ids' must have a valid type name.");
+            }
+        }
+
+        public void SupportInit()
+        {
+            var obj = connection.Query<WithInit>("select 'abc' as Value").Single();
+            obj.Value.Equals("abc");
+            obj.Flags.Equals(31);
+        }
+
+        class WithInit : ISupportInitialize
+        {
+            public string Value { get; set; }
+            public int Flags { get;set; }
+
+            void ISupportInitialize.BeginInit()
+            {
+                Flags += 1;
+            }
+
+            void ISupportInitialize.EndInit()
+            {
+                Flags += 30;
+            }
         }
 
 #if POSTGRESQL
