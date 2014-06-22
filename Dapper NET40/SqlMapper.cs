@@ -19,6 +19,7 @@ using System.Threading;
 using System.Text.RegularExpressions;
 using System.Diagnostics;
 using System.Globalization;
+using System.Data.Common;
 
 namespace Dapper
 {
@@ -45,7 +46,7 @@ namespace Dapper
     /// <summary>
     /// Represents the key aspects of a sql operation
     /// </summary>
-    public  struct CommandDefinition
+    public struct CommandDefinition
     {
         private readonly string commandText;
         private readonly object parameters;
@@ -178,6 +179,48 @@ namespace Dapper
             return action;
         }
 
+
+        static SqlMapper.Link<Type, Action<IDbCommand>> deriveParamtersCache;
+        /// <summary>
+        /// Build a dynamic method for DeriveParameters method using reflection and IL emit and cache it
+        /// </summary>
+        internal static Action<IDbCommand> GetDeriveParameters(IDbCommand command)
+        {
+            if (command == null) return null; // GIGO
+
+            Type commandType = command.GetType();
+            Action<IDbCommand> action = null;
+            if (SqlMapper.Link<Type, Action<IDbCommand>>.TryGet(deriveParamtersCache, commandType, out action))
+            {
+                return action;
+            }
+            
+            DbConnection connection = null;
+            PropertyInfo providerFactoryProp = null;
+            DbProviderFactory providerFactory = null;
+            DbCommandBuilder commandBuilder = null;
+            MethodInfo deriveParametersMethod = null;
+            if ((connection = command.Connection as DbConnection) != null &&
+                (providerFactoryProp = connection.GetType().
+                GetProperty("ProviderFactory", BindingFlags.Instance | BindingFlags.NonPublic)) != null && 
+                (providerFactory = providerFactoryProp.GetValue(connection, null) as DbProviderFactory) != null && 
+                (commandBuilder = providerFactory.CreateCommandBuilder()) != null && 
+                (deriveParametersMethod = commandBuilder.GetType().
+                GetMethod("DeriveParameters", new Type[] { commandType })) != null)
+            {
+                var method = new DynamicMethod(commandBuilder.GetType().Name + "_DeriveParameters", null, new Type[] { typeof(IDbCommand) });
+                var il = method.GetILGenerator();
+                il.Emit(OpCodes.Ldarg_0); // IDbCommand
+                il.Emit(OpCodes.Castclass, commandType); // concrete IDbCommand
+                il.EmitCall(OpCodes.Call, deriveParametersMethod, null);
+                il.Emit(OpCodes.Ret);
+                action = (Action<IDbCommand>)method.CreateDelegate(typeof(Action<IDbCommand>));
+            }
+            
+            // cache it            
+            SqlMapper.Link<Type, Action<IDbCommand>>.TryAdd(ref deriveParamtersCache, commandType, ref action);
+            return action;
+        }
     }
 
     /// <summary>
@@ -1133,6 +1176,7 @@ this IDbConnection cnn, string sql, object param, IDbTransaction transaction, in
                 cmd = command.SetupCommand(cnn, info.ParamReader);
 
                 if (wasClosed) cnn.Open();
+                
                 reader = cmd.ExecuteReader(wasClosed ? CommandBehavior.CloseConnection : CommandBehavior.Default);
                 wasClosed = false; // *if* the connection was closed and we got this far, then we now have a reader
                 // with the CloseConnection flag, so the reader will deal with the connection; we
@@ -3566,6 +3610,7 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
     {
         internal const DbType EnumerableMultiParameter = (DbType)(-1);
         static Dictionary<SqlMapper.Identity, Action<IDbCommand, object>> paramReaderCache = new Dictionary<SqlMapper.Identity, Action<IDbCommand, object>>();
+        static Dictionary<SqlMapper.Identity, IList<ParamInfo>> deriveParametersCache = new Dictionary<SqlMapper.Identity, IList<ParamInfo>>();
 
         Dictionary<string, ParamInfo> parameters = new Dictionary<string, ParamInfo>();
         List<object> templates;
@@ -3587,6 +3632,54 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
             public DbType? DbType { get; set; }
             public int? Size { get; set; }
             public IDbDataParameter AttachedParam { get; set; }
+
+            internal static ParamInfo ToParamInfo(IDataParameter param)
+            {
+                IDbDataParameter dbParam = param as IDbDataParameter;
+
+                ParamInfo pi = new ParamInfo();
+                pi.Name = param.ParameterName;
+                pi.Value = param.Value;
+                pi.ParameterDirection = param.Direction;
+                pi.DbType = param.DbType;
+                if (dbParam != null)
+                {
+                    pi.Size = dbParam.Size;
+                }
+                pi.AttachedParam = dbParam;
+                return pi;
+            }
+
+            internal static ParamInfo ToParamInfo(IDbDataParameter param)
+            {
+                return ToParamInfo((IDataParameter) param);
+            }
+
+            internal static IList<ParamInfo> ToParamInfoList(IDataParameterCollection parameters)
+            {
+                return parameters.Cast<IDataParameter>().Select(dp => ToParamInfo(dp)).ToList();
+            }
+
+            internal static void ToIDataParameter(IDataParameter param, ParamInfo pi)
+            {
+                DbType? dbType = pi.DbType;
+                if (dbType == null && pi.Value != null)
+                { 
+                    dbType = SqlMapper.LookupDbType(pi.Value.GetType(), Clean(pi.Name));
+                }
+                IDbDataParameter dbParam = param as IDbDataParameter;
+                param.ParameterName = pi.Name;
+                param.Value = pi.Value;
+                param.Direction = pi.ParameterDirection;
+                if (dbType != null)
+                {
+                    param.DbType = dbType.Value;
+                }
+                if (dbParam != null && pi.Size != null)
+                {
+                    dbParam.Size = pi.Size.Value;
+                }
+            }
         }
 
         /// <summary>
@@ -3595,15 +3688,15 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
         public DynamicParameters()
         {
             RemoveUnused = true;
+            DeriveParameters = false;
         }
 
         /// <summary>
         /// construct a dynamic parameter bag
         /// </summary>
         /// <param name="template">can be an anonymous type or a DynamicParameters bag</param>
-        public DynamicParameters(object template)
+        public DynamicParameters(object template) : this()
         {
-            RemoveUnused = true;
             AddDynamicParams(template);
         }
 
@@ -3711,6 +3804,11 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
         public bool RemoveUnused { get; set; }
 
         /// <summary>
+        /// If true, the command-storedprocedure is inspected and parameters are derived to match the procedure definition
+        /// </summary>
+        public bool DeriveParameters { get; set; }
+
+        /// <summary>
         /// Add all the parameters needed to the command just before it executes
         /// </summary>
         /// <param name="command">The raw command prior to execution</param>
@@ -3797,6 +3895,81 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
                     param.AttachedParam = p;
                 }
             }
+
+            Action<IDbCommand> deriveParametersAction = null;
+            if (FeatureSupport.Get(command.Connection).DerivedParameters &&  
+                    DeriveParameters && command.CommandType == CommandType.StoredProcedure && 
+                    (deriveParametersAction = CommandDefinition.GetDeriveParameters(command)) != null)
+            {
+                // backup command parameters
+                IDictionary<string, ParamInfo> backupParameters = new Dictionary<string, ParamInfo>(StringComparer.InvariantCultureIgnoreCase);
+                ParamInfo returnParameter = null;
+                foreach (IDataParameter param in command.Parameters)
+                {
+                    ParamInfo pi = ParamInfo.ToParamInfo(param);
+                    backupParameters.Add(Clean(pi.Name), pi);
+                    if (param.Direction == ParameterDirection.ReturnValue)
+                    {
+                        returnParameter = pi;
+                    }
+                }
+                // remove all parameters
+                command.Parameters.Clear();
+                
+                lock (deriveParametersCache)
+                {
+                    IList<ParamInfo> derivedParameters = null;
+                    if (!deriveParametersCache.TryGetValue(identity, out derivedParameters))
+                    {
+                        bool wasClosed = command.Connection.State == ConnectionState.Closed;
+                        try
+                        {
+                            if (wasClosed) command.Connection.Open();
+                            // derive parameters 
+                            deriveParametersAction(command);
+                            deriveParametersCache[identity] = (derivedParameters = ParamInfo.ToParamInfoList(command.Parameters));
+                        }
+                        finally
+                        {
+                            if (wasClosed) command.Connection.Close();
+                        }
+                    }
+                    else
+                    {
+                        // add derived parameters found in cache
+                        foreach (ParamInfo pi in derivedParameters)
+                        {
+                            var param = command.CreateParameter();
+                            ParamInfo.ToIDataParameter(param, pi);
+                            command.Parameters.Add(param);
+                        }
+                    }
+                }
+
+                foreach (IDataParameter param in command.Parameters)
+                {
+                    ParamInfo pi;
+                    if (backupParameters.TryGetValue(Clean(param.ParameterName), out pi))
+                    {
+                        // restore parameter value and name
+                        param.Value = pi.Value;
+                        param.ParameterName = Clean(pi.Name);
+                    }
+                    else if(returnParameter != null && param.Direction == ParameterDirection.ReturnValue)
+                    {
+                        // rename return parameter
+                        param.Value = returnParameter.Value;
+                        param.ParameterName = Clean(returnParameter.Name);
+                    }
+                }
+
+                // re-attach parameters
+                foreach (string paramName in parameters.Keys)
+                {
+                    parameters[paramName].AttachedParam = command.Parameters[paramName] as IDbDataParameter;
+                }
+            }
+
             // note: most non-priveleged implementations would use: this.ReplaceLiterals(command);
             if(literals.Count != 0) SqlMapper.ReplaceLiterals(this, command, literals);
         }
@@ -3905,7 +4078,7 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
         {
             if (IsFixedLength && Length == -1)
             {
-                throw new InvalidOperationException("If specifying IsFixedLength,  a Length must also be specified");
+                throw new InvalidOperationException("If specifying IsFixedLength, a Length must also be specified");
             }
             var param = command.CreateParameter();
             param.ParameterName = name;
@@ -3932,8 +4105,8 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
         /// Dictionary of supported features index by connection type name
         /// </summary>
         private static readonly Dictionary<string, FeatureSupport> FeatureList = new Dictionary<string, FeatureSupport>(StringComparer.InvariantCultureIgnoreCase) {
-				{"sqlserverconnection", new FeatureSupport { Arrays = false}},
-				{"npgsqlconnection", new FeatureSupport {Arrays = true}}
+				{"sqlserverconnection", new FeatureSupport { Arrays = false, DerivedParameters = true}},
+				{"npgsqlconnection", new FeatureSupport {Arrays = true, DerivedParameters = false}}
 		};
 
         /// <summary>
@@ -3950,6 +4123,11 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
         /// True if the db supports array columns e.g. Postgresql
         /// </summary>
         public bool Arrays { get; set; }
+
+        /// <summary>
+        /// True if the db provider implements parameter derivation using e.g. DeriveParameters method
+        /// </summary>
+        public bool DerivedParameters { get; set; }
     }
 
     /// <summary>

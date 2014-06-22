@@ -19,6 +19,7 @@ using System.Threading;
 using Npgsql;
 #endif
 
+
 namespace SqlMapper
 {
 
@@ -1595,7 +1596,7 @@ end");
             {
                 msg = ex.Message;
             }
-            msg.IsEqualTo("The member Foo of type System.GenericUriParser cannot be used as a parameter value");
+            msg.IsEqualTo("Must declare the scalar variable \"@Foo\".");
         }
         public void TestUnexpectedButFilteredDataMessage()
         {
@@ -2554,24 +2555,34 @@ end");
 
         }
 
-        public void TestProcedureParametersWithoutDbType()
+        public void TestProcedureWithDerivedParameters()
         {
             Post p = new Post();
             p.Id = 1;
-            p.Content = "abc";
-            connection.Execute(@"CREATE PROCEDURE #TestProcedureParametersWithoutDbType
+            p.Comment = null; // unused parameter
+            connection.Execute(@"CREATE PROCEDURE #TestProcedureWithDerivedParameters
     @Id int,
-    @Content varchar(100)
+    @Title datetime = null, -- missing parameter   
+    @Date datetime = null output
     AS 
     BEGIN
-    SELECT @Id as Id, @Content as Content
+    SET @Date = '20140404'
+    SELECT @Id as Id, @Title as Title
+    RETURN 4
     END");
 
-            var ps = connection.Query<Post>("#TestProcedureParametersWithoutDbType", p, commandType: CommandType.StoredProcedure);
+            DynamicParameters args = new DynamicParameters(p) { DeriveParameters = true };
+            args.Add("Date", new DateTime(2011, 1, 1), null, ParameterDirection.InputOutput, null);
+            args.Add("Result", 0, null, ParameterDirection.ReturnValue, null);
+            
+            var ps = connection.Query<Post>("#TestProcedureWithDerivedParameters", args, commandType: CommandType.StoredProcedure);
             ps.IsNotNull();
             ps.Count().IsEqualTo(1);
             ps.Single().Id.IsEqualTo(1);
-            ps.Single().Content.IsEqualTo("abc");
+            ps.Single().Comment.IsEqualTo(null);
+
+            args.Get<DateTime>("Date").IsEqualTo(new DateTime(2014, 4, 4));
+            args.Get<int>("Result").IsEqualTo(4);
         }
 
         class TransactedConnection : IDbConnection
