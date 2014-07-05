@@ -180,8 +180,6 @@ namespace Dapper
             SqlMapper.Link<Type, Action<IDbCommand, bool>>.TryAdd(ref bindByNameCache, commandType, ref action);
             return action;
         }
-<<<<<<< HEAD
-
 
         static SqlMapper.Link<Type, Action<IDbCommand>> deriveParamtersCache;
         /// <summary>
@@ -224,8 +222,6 @@ namespace Dapper
             SqlMapper.Link<Type, Action<IDbCommand>>.TryAdd(ref deriveParamtersCache, commandType, ref action);
             return action;
         }
-=======
->>>>>>> upstream/master
     }
 
     /// <summary>
@@ -737,11 +733,7 @@ namespace Dapper
         private static readonly Dictionary<Type, ITypeHandler> typeHandlers = new Dictionary<Type, ITypeHandler>();
 
         internal const string LinqBinary = "System.Data.Linq.Binary";
-<<<<<<< HEAD
-        internal static DbType? LookupDbType(Type type, string name)
-=======
-        internal static DbType LookupDbType(Type type, string name, out ITypeHandler handler)
->>>>>>> upstream/master
+        internal static DbType? LookupDbType(Type type, string name, out ITypeHandler handler)
         {
             DbType dbType;
             handler = null;
@@ -763,16 +755,11 @@ namespace Dapper
             {
                 return DynamicParameters.EnumerableMultiParameter;
             }
-<<<<<<< HEAD
-            return null;
-=======
-
             if (typeHandlers.TryGetValue(type, out handler))
             {
                 return DbType.Object;
             }
-            throw new NotSupportedException(string.Format("The member {0} of type {1} cannot be used as a parameter value", name, type));
->>>>>>> upstream/master
+            return null;
         }
 
 
@@ -2599,14 +2586,11 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                     il.EmitCall(OpCodes.Callvirt, prop.PropertyType.GetMethod("AddParameter"), null); // stack is now [parameters]
                     continue;
                 }
-<<<<<<< HEAD
-                DbType? dbType = LookupDbType(prop.PropertyType, prop.Name);
-                if (dbType == null) { continue; }
-                
-=======
+
                 ITypeHandler handler;
-                DbType dbType = LookupDbType(prop.PropertyType, prop.Name, out handler);
->>>>>>> upstream/master
+                DbType? dbType = LookupDbType(prop.PropertyType, prop.Name, out handler);
+                if (dbType == null) { continue; }
+
                 if (dbType == DynamicParameters.EnumerableMultiParameter)
                 {
                     // this actually represents special handling for list types;
@@ -3862,10 +3846,11 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
 
             internal static void ToIDataParameter(IDataParameter param, ParamInfo pi)
             {
+                SqlMapper.ITypeHandler handler;
                 DbType? dbType = pi.DbType;
                 if (dbType == null && pi.Value != null)
                 { 
-                    dbType = SqlMapper.LookupDbType(pi.Value.GetType(), Clean(pi.Name));
+                    dbType = SqlMapper.LookupDbType(pi.Value.GetType(), Clean(pi.Name), out handler);
                 }
                 IDbDataParameter dbParam = param as IDbDataParameter;
                 param.ParameterName = pi.Name;
