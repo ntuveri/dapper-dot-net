@@ -23,6 +23,8 @@ using System.Data.Common;
 
 namespace Dapper
 {
+    [AssemblyNeutral, AttributeUsage(AttributeTargets.Class | AttributeTargets.Interface | AttributeTargets.Struct, AllowMultiple = false, Inherited = false)]
+    internal sealed class AssemblyNeutralAttribute : Attribute { }
 
     /// <summary>
     /// Additional state flags that control command behaviour
@@ -178,6 +180,7 @@ namespace Dapper
             SqlMapper.Link<Type, Action<IDbCommand, bool>>.TryAdd(ref bindByNameCache, commandType, ref action);
             return action;
         }
+<<<<<<< HEAD
 
 
         static SqlMapper.Link<Type, Action<IDbCommand>> deriveParamtersCache;
@@ -221,6 +224,8 @@ namespace Dapper
             SqlMapper.Link<Type, Action<IDbCommand>>.TryAdd(ref deriveParamtersCache, commandType, ref action);
             return action;
         }
+=======
+>>>>>>> upstream/master
     }
 
     /// <summary>
@@ -255,6 +260,7 @@ namespace Dapper
         /// <summary>
         /// Implement this interface to pass an arbitrary db specific parameter to Dapper
         /// </summary>
+        [AssemblyNeutral]
         public interface ICustomQueryParameter
         {
             /// <summary>
@@ -263,6 +269,65 @@ namespace Dapper
             /// <param name="command">The raw command prior to execution</param>
             /// <param name="name">Parameter name</param>
             void AddParameter(IDbCommand command, string name);
+        }
+
+        /// <summary>
+        /// Implement this interface to perform custom type-based parameter handling and value parsing
+        /// </summary>
+        [AssemblyNeutral]
+        public interface ITypeHandler
+        {
+            /// <summary>
+            /// Assign the value of a parameter before a command executes
+            /// </summary>
+            /// <param name="parameter">The parameter to configure</param>
+            /// <param name="value">Parameter value</param>
+            void SetValue(IDbDataParameter parameter, object value);
+
+            /// <summary>
+            /// Parse a database value back to a typed value
+            /// </summary>
+            /// <param name="value">The value from the database</param>
+            /// <param name="destinationType">The type to parse to</param>
+            /// <returns>The typed value</returns>
+            object Parse(Type destinationType, object value);
+        }
+
+        /// <summary>
+        /// Base-class for simple type-handlers
+        /// </summary>
+        public abstract class TypeHandler<T> : ITypeHandler
+        {
+            /// <summary>
+            /// Assign the value of a parameter before a command executes
+            /// </summary>
+            /// <param name="parameter">The parameter to configure</param>
+            /// <param name="value">Parameter value</param>
+            public abstract void SetValue(IDbDataParameter parameter, T value);
+
+            /// <summary>
+            /// Parse a database value back to a typed value
+            /// </summary>
+            /// <param name="value">The value from the database</param>
+            /// <returns>The typed value</returns>
+            public abstract T Parse(object value);
+
+            void ITypeHandler.SetValue(IDbDataParameter parameter, object value)
+            {
+                if (value is DBNull)
+                {
+                    parameter.Value = value;
+                }
+                else
+                {
+                    SetValue(parameter, (T)value);
+                }
+            }
+
+            object ITypeHandler.Parse(Type destinationType, object value)
+            {
+                return Parse(value);
+            }
         }
 
         /// <summary>
@@ -602,6 +667,8 @@ namespace Dapper
             typeMap[typeof(DateTimeOffset?)] = DbType.DateTimeOffset;
             typeMap[typeof(TimeSpan?)] = DbType.Time;
             typeMap[typeof(object)] = DbType.Object;
+
+            AddTypeHandler(typeof(DataTable), new DataTableHandler());
         }
         /// <summary>
         /// Configire the specified type to be mapped to a given db-type
@@ -611,10 +678,73 @@ namespace Dapper
             typeMap[type] = dbType;
         }
 
+        /// <summary>
+        /// Configire the specified type to be processed by a custom handler
+        /// </summary>
+        public static void AddTypeHandler(Type type, ITypeHandler handler)
+        {
+            if (type == null) throw new ArgumentNullException("type");
+#pragma warning disable 618
+            typeof(TypeHandlerCache<>).MakeGenericType(type).GetMethod("SetHandler", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { handler });
+#pragma warning restore 618
+            if (handler == null) typeHandlers.Remove(type);
+            else typeHandlers[type] = handler;
+        }
+        /// <summary>
+        /// Configire the specified type to be processed by a custom handler
+        /// </summary>
+        public static void AddTypeHandler<T>(TypeHandler<T> handler)
+        {
+            AddTypeHandler(typeof(T), handler);
+        }
+
+        /// <summary>
+        /// Not intended for direct usage
+        /// </summary>
+        [Obsolete("Not intended for direct usage", false)]
+        [Browsable(false), EditorBrowsable(EditorBrowsableState.Never)]
+        public static class TypeHandlerCache<T>
+        {
+            /// <summary>
+            /// Not intended for direct usage
+            /// </summary>
+            [Obsolete("Not intended for direct usage", true)]
+            public static T Parse(object value)
+            {
+                return (T)handler.Parse(typeof(T), value);
+                
+            }
+
+            /// <summary>
+            /// Not intended for direct usage
+            /// </summary>
+            [Obsolete("Not intended for direct usage", true)]
+            public static void SetValue(IDbDataParameter parameter, object value)
+            {
+                handler.SetValue(parameter, value);
+            }
+
+            internal static void SetHandler(ITypeHandler handler)
+            {
+#pragma warning disable 618
+                TypeHandlerCache<T>.handler = handler;
+#pragma warning restore 618
+            }
+
+            private static ITypeHandler handler;
+        }
+
+        private static readonly Dictionary<Type, ITypeHandler> typeHandlers = new Dictionary<Type, ITypeHandler>();
+
         internal const string LinqBinary = "System.Data.Linq.Binary";
+<<<<<<< HEAD
         internal static DbType? LookupDbType(Type type, string name)
+=======
+        internal static DbType LookupDbType(Type type, string name, out ITypeHandler handler)
+>>>>>>> upstream/master
         {
             DbType dbType;
+            handler = null;
             var nullUnderlyingType = Nullable.GetUnderlyingType(type);
             if (nullUnderlyingType != null) type = nullUnderlyingType;
             if (type.IsEnum && !typeMap.ContainsKey(type))
@@ -633,7 +763,16 @@ namespace Dapper
             {
                 return DynamicParameters.EnumerableMultiParameter;
             }
+<<<<<<< HEAD
             return null;
+=======
+
+            if (typeHandlers.TryGetValue(type, out handler))
+            {
+                return DbType.Object;
+            }
+            throw new NotSupportedException(string.Format("The member {0} of type {1} cannot be used as a parameter value", name, type));
+>>>>>>> upstream/master
         }
 
 
@@ -2454,15 +2593,20 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                 if (typeof(ICustomQueryParameter).IsAssignableFrom(prop.PropertyType))
                 {
                     il.Emit(OpCodes.Ldloc_0); // stack is now [parameters] [typed-param]
-                    il.Emit(OpCodes.Callvirt, prop.GetGetMethod()); // stack is [parameters] [dbstring]
-                    il.Emit(OpCodes.Ldarg_0); // stack is now [parameters] [dbstring] [command]
-                    il.Emit(OpCodes.Ldstr, prop.Name); // stack is now [parameters] [dbstring] [command] [name]
+                    il.Emit(OpCodes.Callvirt, prop.GetGetMethod()); // stack is [parameters] [custom]
+                    il.Emit(OpCodes.Ldarg_0); // stack is now [parameters] [custom] [command]
+                    il.Emit(OpCodes.Ldstr, prop.Name); // stack is now [parameters] [custom] [command] [name]
                     il.EmitCall(OpCodes.Callvirt, prop.PropertyType.GetMethod("AddParameter"), null); // stack is now [parameters]
                     continue;
                 }
+<<<<<<< HEAD
                 DbType? dbType = LookupDbType(prop.PropertyType, prop.Name);
                 if (dbType == null) { continue; }
                 
+=======
+                ITypeHandler handler;
+                DbType dbType = LookupDbType(prop.PropertyType, prop.Name, out handler);
+>>>>>>> upstream/master
                 if (dbType == DynamicParameters.EnumerableMultiParameter)
                 {
                     // this actually represents special handling for list types;
@@ -2496,7 +2640,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                     il.Emit(OpCodes.Ldstr, prop.Name); // stack is now [parameters] [parameters] [parameter] [parameter] [name]
                     il.EmitCall(OpCodes.Callvirt, typeof(IDataParameter).GetProperty("ParameterName").GetSetMethod(), null);// stack is now [parameters] [parameters] [parameter]
                 }
-                if (dbType != DbType.Time) // https://connect.microsoft.com/VisualStudio/feedback/details/381934/sqlparameter-dbtype-dbtype-time-sets-the-parameter-to-sqldbtype-datetime-instead-of-sqldbtype-time
+                if (dbType != DbType.Time && handler == null) // https://connect.microsoft.com/VisualStudio/feedback/details/381934/sqlparameter-dbtype-dbtype-time-sets-the-parameter-to-sqldbtype-datetime-instead-of-sqldbtype-time
                 {
                     il.Emit(OpCodes.Dup);// stack is now [parameters] [[parameters]] [parameter] [parameter]
                     EmitInt32(il, (int)dbType);// stack is now [parameters] [[parameters]] [parameter] [parameter] [db-type]
@@ -2564,7 +2708,17 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                     if (allDone != null) il.MarkLabel(allDone.Value);
                     // relative stack [boxed value or DBNull]
                 }
-                il.EmitCall(OpCodes.Callvirt, typeof(IDataParameter).GetProperty("Value").GetSetMethod(), null);// stack is now [parameters] [[parameters]] [parameter]
+
+                if (handler != null)
+                {
+#pragma warning disable 618
+                    il.Emit(OpCodes.Call, typeof(TypeHandlerCache<>).MakeGenericType(prop.PropertyType).GetMethod("SetValue")); // stack is now [parameters] [[parameters]] [parameter]
+#pragma warning restore 618
+                }
+                else
+                {
+                    il.EmitCall(OpCodes.Callvirt, typeof(IDataParameter).GetProperty("Value").GetSetMethod(), null);// stack is now [parameters] [[parameters]] [parameter]
+                }
 
                 if (prop.PropertyType == typeof(string))
                 {
@@ -2781,6 +2935,15 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                 {
                     var val = r.GetValue(index);
                     return val is DBNull ? null : Enum.ToObject(effectiveType, val);
+                };
+            }
+            ITypeHandler handler;
+            if(typeHandlers.TryGetValue(type, out handler))
+            {
+                return r =>
+                {
+                    var val = r.GetValue(index);
+                    return val is DBNull ? null : handler.Parse(type, val);
                 };
             }
             return r =>
@@ -3024,7 +3187,16 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
                             TypeCode dataTypeCode = Type.GetTypeCode(dataType), unboxTypeCode = Type.GetTypeCode(unboxType);
                             if (dataType == unboxType || dataTypeCode == unboxTypeCode || dataTypeCode == Type.GetTypeCode(nullUnderlyingType))
                             {
-                                il.Emit(OpCodes.Unbox_Any, unboxType); // stack is now [target][target][typed-value]
+                                if (typeHandlers.ContainsKey(unboxType))
+                                {
+#pragma warning disable 618
+                                    il.EmitCall(OpCodes.Call, typeof(TypeHandlerCache<>).MakeGenericType(unboxType).GetMethod("Parse"), null); // stack is now [target][target][typed-value]
+#pragma warning restore 618
+                                }
+                                else
+                                {
+                                    il.Emit(OpCodes.Unbox_Any, unboxType); // stack is now [target][target][typed-value]
+                                }
                             }
                             else
                             {
@@ -3339,6 +3511,11 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
 
 
         /// <summary>
+        /// Key used to indicate the type name associated with a DataTable
+        /// </summary>
+        private const string DataTableTypeNameKey = "dapper:TypeName";
+
+        /// <summary>
         /// How should connection strings be compared for equivalence? Defaults to StringComparer.Ordinal.
         /// Providing a custom implementation can be useful for allowing multi-tenancy databases with identical
         /// schema to share startegies. Note that usual equivalence rules apply: any equivalent connection strings
@@ -3350,6 +3527,7 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
             set { connectionStringComparer = value ?? StringComparer.Ordinal; }
         }
         private static IEqualityComparer<string> connectionStringComparer = StringComparer.Ordinal;
+
 
         /// <summary>
         /// The grid reader provides interfaces for reading multiple result sets from a Dapper query 
@@ -3601,6 +3779,28 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
         {
             return new TableValuedParameter(table, typeName);
         }
+
+        /// <summary>
+        /// Associate a DataTable with a type name
+        /// </summary>
+        public static void SetTypeName(this DataTable table, string typeName)
+        {
+            if (table != null)
+            {
+                if (string.IsNullOrEmpty(typeName))
+                    table.ExtendedProperties.Remove(DataTableTypeNameKey);
+                else
+                    table.ExtendedProperties[DataTableTypeNameKey] = typeName;
+            }
+        }
+
+        /// <summary>
+        /// Fetch the type name associated with a DataTable
+        /// </summary>
+        public static string GetTypeName(this DataTable table)
+        {
+            return table == null ? null : table.ExtendedProperties[DataTableTypeNameKey] as string;
+        }
     }
 
     /// <summary>
@@ -3843,8 +4043,8 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
                 string name = Clean(param.Name);
                 var isCustomQueryParameter = val is SqlMapper.ICustomQueryParameter;
 
-                if (dbType == null && val != null && !isCustomQueryParameter) dbType = SqlMapper.LookupDbType(val.GetType(), name);
-
+                SqlMapper.ITypeHandler handler = null;
+                if (dbType == null && val != null && !isCustomQueryParameter) dbType = SqlMapper.LookupDbType(val.GetType(), name, out handler);
                 if (dbType == DynamicParameters.EnumerableMultiParameter)
                 {
 #pragma warning disable 612, 618
@@ -3869,8 +4069,13 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
                     {
                         p = (IDbDataParameter)command.Parameters[name];
                     }
-
-                    p.Value = val ?? DBNull.Value;
+                    if (handler == null)
+                    {
+                        p.Value = val ?? DBNull.Value;
+                    } else
+                    {
+                        handler.SetValue(p, val ?? DBNull.Value);
+                    }
                     p.Direction = param.ParameterDirection;
                     var s = val as string;
                     if (s != null)
@@ -4007,6 +4212,19 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
         }
     }
 
+    sealed class DataTableHandler : Dapper.SqlMapper.ITypeHandler
+    {
+        public object Parse(Type destinationType, object value)
+        {
+            throw new NotImplementedException();
+        }
+
+        public void SetValue(IDbDataParameter parameter, object value)
+        {
+            TableValuedParameter.Set(parameter, value as DataTable, null);
+        }
+    }
+
     /// <summary>
     /// Used to pass a DataTable as a TableValuedParameter
     /// </summary>
@@ -4027,21 +4245,39 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
             this.table = table;
             this.typeName = typeName;
         }
+        static readonly Action<System.Data.SqlClient.SqlParameter, string> setTypeName;
+        static TableValuedParameter()
+        {
+            var prop = typeof(System.Data.SqlClient.SqlParameter).GetProperty("TypeName", BindingFlags.Instance | BindingFlags.Public);
+            if(prop != null && prop.PropertyType == typeof(string) && prop.CanWrite)
+            {
+                setTypeName = (Action<System.Data.SqlClient.SqlParameter, string>)
+                    Delegate.CreateDelegate(typeof(Action<System.Data.SqlClient.SqlParameter, string>), prop.GetSetMethod());
+            }
+        }
         void SqlMapper.ICustomQueryParameter.AddParameter(IDbCommand command, string name)
         {
             var param = command.CreateParameter();
             param.ParameterName = name;
-            param.Value = (object)table ?? DBNull.Value;
+            Set(param, table, typeName);
+            command.Parameters.Add(param);
+        }
+        internal static void Set(IDbDataParameter parameter, DataTable table, string typeName)
+        {
+            parameter.Value = (object)table ?? DBNull.Value;
+            if (string.IsNullOrEmpty(typeName) && table != null)
+            {
+                typeName = SqlMapper.GetTypeName(table);
+            }
             if (!string.IsNullOrEmpty(typeName))
             {
-                var sqlParam = param as System.Data.SqlClient.SqlParameter;
+                var sqlParam = parameter as System.Data.SqlClient.SqlParameter;
                 if (sqlParam != null)
                 {
-                    sqlParam.TypeName = typeName;
+                    if (setTypeName != null) setTypeName(sqlParam, typeName);
                     sqlParam.SqlDbType = SqlDbType.Structured;
                 }
             }
-            command.Parameters.Add(param);
         }
     }
     /// <summary>
@@ -4271,7 +4507,13 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
         {
             return propertyInfo.DeclaringType == type ?
                 propertyInfo.GetSetMethod(true) :
-                propertyInfo.DeclaringType.GetProperty(propertyInfo.Name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance).GetSetMethod(true);
+                propertyInfo.DeclaringType.GetProperty(
+                   propertyInfo.Name,
+                   BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                   Type.DefaultBinder,
+                   propertyInfo.PropertyType,
+                   propertyInfo.GetIndexParameters().Select(p => p.ParameterType).ToArray(),
+                   null).GetSetMethod(true);
         }
 
         internal static List<PropertyInfo> GetSettableProps(Type t)

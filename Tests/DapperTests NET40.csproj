@@ -240,13 +240,17 @@
     <Folder Include="Simple.Data\" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="..\Dapper NET45\Dapper NET45.csproj">
-      <Project>{0fff5bc7-0a4b-4d87-835e-4fad70937507}</Project>
-      <Name>Dapper NET45</Name>
+    <ProjectReference Include="..\Dapper NET40\Dapper NET40.csproj">
+      <Project>{daf737e1-05b5-4189-a5aa-dac6233b64d7}</Project>
+      <Name>Dapper NET40</Name>
     </ProjectReference>
     <ProjectReference Include="..\Dapper.Contrib\Dapper.Contrib.csproj">
       <Project>{C2FC4DF5-C8D1-4EA8-8E0C-85A3793EB0BB}</Project>
       <Name>Dapper.Contrib</Name>
+    </ProjectReference>
+    <ProjectReference Include="..\Dapper.EntityFramework NET40\Dapper.EntityFramework NET40.csproj">
+      <Project>{2544dfba-7f64-4003-9c36-d8337f770a36}</Project>
+      <Name>Dapper.EntityFramework NET40</Name>
     </ProjectReference>
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
