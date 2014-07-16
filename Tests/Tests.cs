@@ -3016,6 +3016,66 @@ option (optimize for (@vals unKnoWn))";
             row.Geo.IsNotNull();
         }
 
+        public void TypeBasedViaDynamic()
+        {
+            Type type = GetSomeType();
+
+            dynamic template = Activator.CreateInstance(type);
+            dynamic actual = CheetViaDynamic(template, "select @A as [A], @B as [B]", new { A = 123, B = "abc" });
+            ((object)actual).GetType().IsEqualTo(type);
+            int a = actual.A;
+            string b = actual.B;
+            a.IsEqualTo(123);
+            b.IsEqualTo("abc");
+        }
+        public void TypeBasedViaType()
+        {
+            Type type = GetSomeType();
+
+            dynamic actual = connection.Query(type, "select @A as [A], @B as [B]", new { A = 123, B = "abc" }).FirstOrDefault();
+            ((object)actual).GetType().IsEqualTo(type);
+            int a = actual.A;
+            string b = actual.B;
+            a.IsEqualTo(123);
+            b.IsEqualTo("abc");
+        }
+        public void TypeBasedViaTypeMulti()
+        {
+            Type type = GetSomeType();
+
+            dynamic first, second;
+            using(var multi = connection.QueryMultiple("select @A as [A], @B as [B]; select @C as [A], @D as [B]",
+                new { A = 123, B = "abc", C = 456, D = "def" }))
+            {
+                first = multi.Read(type).Single();
+                second = multi.Read(type).Single();
+            }
+            ((object)first).GetType().IsEqualTo(type);
+            int a = first.A;
+            string b = first.B;
+            a.IsEqualTo(123);
+            b.IsEqualTo("abc");
+
+            ((object)second).GetType().IsEqualTo(type);
+            a = second.A;
+            b = second.B;
+            a.IsEqualTo(456);
+            b.IsEqualTo("def");
+        }
+        T CheetViaDynamic<T>(T template, string query, object args)
+        {
+            return connection.Query<T>(query, args).SingleOrDefault();
+        }
+        static Type GetSomeType()
+        {
+            return typeof(SomeType);
+        }
+        public class SomeType
+        {
+            public int A { get;set; }
+            public string B { get;set; }
+        }
+
         class WithInit : ISupportInitialize
         {
             public string Value { get; set; }
@@ -3030,6 +3090,91 @@ option (optimize for (@vals unKnoWn))";
             {
                 Flags += 30;
             }
+        }
+
+        public void SO24607639_NullableBools()
+        {
+            var obj = connection.Query<HazBools>(
+                @"declare @vals table (A bit null, B bit null, C bit null);
+                insert @vals (A,B,C) values (1,0,null);
+                select * from @vals").Single();
+            obj.IsNotNull();
+            obj.A.Value.IsEqualTo(true);
+            obj.B.Value.IsEqualTo(false);
+            obj.C.IsNull();
+        }
+        class HazBools
+        {
+            public bool? A { get; set; }
+            public bool? B { get; set; }
+            public bool? C { get; set; }
+        }
+
+        public void SO24605346_ProcsAndStrings()
+        {
+            connection.Execute(@"create proc #GetPracticeRebateOrderByInvoiceNumber @TaxInvoiceNumber nvarchar(20) as
+                select @TaxInvoiceNumber as [fTaxInvoiceNumber]");
+            string InvoiceNumber = "INV0000000028PPN";
+            var result = connection.Query<PracticeRebateOrders>("#GetPracticeRebateOrderByInvoiceNumber", new
+            {
+                TaxInvoiceNumber = InvoiceNumber
+            }, commandType: CommandType.StoredProcedure).FirstOrDefault();
+
+            result.TaxInvoiceNumber.IsEqualTo("INV0000000028PPN");
+        }
+        class PracticeRebateOrders
+        {
+            public string fTaxInvoiceNumber;
+            [System.Xml.Serialization.XmlElementAttribute(Form = System.Xml.Schema.XmlSchemaForm.Unqualified)]
+            public string TaxInvoiceNumber { get { return fTaxInvoiceNumber; } set { fTaxInvoiceNumber = value; } }
+        }
+
+        public class RatingValueHandler : Dapper.SqlMapper.TypeHandler<RatingValue>
+        {
+            private RatingValueHandler() { }
+            public static readonly RatingValueHandler Default = new RatingValueHandler();
+            public override RatingValue Parse(object value)
+            {
+                if (value is Int32)
+                    return new RatingValue() { Value = (Int32)value };
+
+                throw new FormatException("Invalid conversion to RatingValue");
+            }
+
+            public override void SetValue(System.Data.IDbDataParameter parameter, RatingValue value)
+            {
+                // ... null, range checks etc ...
+                parameter.DbType = System.Data.DbType.Int32;
+                parameter.Value = value.Value;
+            }
+        }
+        public class RatingValue
+        {
+            public Int32 Value { get; set; }
+            // ... some other properties etc ...
+        }
+
+        public class MyResult
+        {
+            public String CategoryName { get; set; }
+            public RatingValue CategoryRating { get; set; }
+        }
+
+        public void SO24740733_TestCustomValueHandler()
+        {
+            Dapper.SqlMapper.AddTypeHandler(RatingValueHandler.Default);
+            var foo = connection.Query<MyResult>("SELECT 'Foo' AS CategoryName, 200 AS CategoryRating").Single();
+
+            foo.CategoryName.IsEqualTo("Foo");
+            foo.CategoryRating.Value.IsEqualTo(200);
+        }
+
+        public void SO24740733_TestCustomValueSingleColumn()
+        {
+            Dapper.SqlMapper.AddTypeHandler(RatingValueHandler.Default);
+            var foo = connection.Query<RatingValue>("SELECT 200 AS CategoryRating").Single();
+
+            foo.Value.IsEqualTo(200);
         }
 
 #if POSTGRESQL
@@ -3061,7 +3206,7 @@ option (optimize for (@vals unKnoWn))";
                 conn.Open();
                 IDbTransaction transaction = conn.BeginTransaction();
                 conn.Execute("create table tcat ( id serial not null, breed character varying(20) not null, name character varying (20) not null);");
-                conn.Execute("insert tcat(breed, name) values(:breed, :name) ", Cats);
+                conn.Execute("insert into tcat(breed, name) values(:breed, :name) ", Cats);
 
                 var r = conn.Query<Cat>("select * from tcat where id=any(:catids)", new { catids = new[] { 1, 3, 5 } });
                 r.Count().IsEqualTo(3);

@@ -1211,10 +1211,29 @@ this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transac
 )
         {
             var command = new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, buffered ? CommandFlags.Buffered : CommandFlags.None);
-            var data = QueryImpl<T>(cnn, command);
+            var data = QueryImpl<T>(cnn, command, typeof(T));
             return command.Buffered ? data.ToList() : data;
         }
 
+        /// <summary>
+        /// Executes a query, returning the data typed as per the Type suggested
+        /// </summary>
+        /// <returns>A sequence of data of the supplied type; if a basic type (int, string, etc) is queried then the data from the first column in assumed, otherwise an instance is
+        /// created per row, and a direct column-name===member-name mapping is assumed (case insensitive).
+        /// </returns>
+        public static IEnumerable<object> Query(
+#if CSHARP30
+this IDbConnection cnn, Type type, string sql, object param, IDbTransaction transaction, bool buffered, int? commandTimeout, CommandType? commandType
+#else
+this IDbConnection cnn, Type type, string sql, object param = null, IDbTransaction transaction = null, bool buffered = true, int? commandTimeout = null, CommandType? commandType = null
+#endif
+        )
+        {
+            if (type == null) throw new ArgumentNullException("type");
+            var command = new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, buffered ? CommandFlags.Buffered : CommandFlags.None);
+            var data = QueryImpl<object>(cnn, command, type);
+            return command.Buffered ? data.ToList() : data;
+        }
         /// <summary>
         /// Executes a query, returning the data typed as per T
         /// </summary>
@@ -1224,7 +1243,7 @@ this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transac
         /// </returns>
         public static IEnumerable<T> Query<T>(this IDbConnection cnn, CommandDefinition command)
         {
-            var data = QueryImpl<T>(cnn, command);
+            var data = QueryImpl<T>(cnn, command, typeof(T));
             return command.Buffered ? data.ToList() : data;
         }
 
@@ -1287,10 +1306,10 @@ this IDbConnection cnn, string sql, object param, IDbTransaction transaction, in
             }
         }
 
-        private static IEnumerable<T> QueryImpl<T>(this IDbConnection cnn, CommandDefinition command)
+        private static IEnumerable<T> QueryImpl<T>(this IDbConnection cnn, CommandDefinition command, Type effectiveType)
         {
             object param = command.Parameters;
-            var identity = new Identity(command.CommandText, command.CommandType, cnn, typeof(T), param == null ? null : param.GetType(), null);
+            var identity = new Identity(command.CommandText, command.CommandType, cnn, effectiveType, param == null ? null : param.GetType(), null);
             var info = GetCacheInfo(identity, param);
 
             IDbCommand cmd = null;
@@ -1312,7 +1331,7 @@ this IDbConnection cnn, string sql, object param, IDbTransaction transaction, in
                 int hash = GetColumnHash(reader);
                 if (tuple.Func == null || tuple.Hash != hash)
                 {
-                    tuple = info.Deserializer = new DeserializerState(hash, GetDeserializer(typeof(T), reader, 0, -1, false));
+                    tuple = info.Deserializer = new DeserializerState(hash, GetDeserializer(effectiveType, reader, 0, -1, false));
                     SetQueryCache(identity, info);
                 }
 
@@ -1321,10 +1340,13 @@ this IDbConnection cnn, string sql, object param, IDbTransaction transaction, in
                 while (reader.Read())
                 {
                     object val = func(reader);
-                    if (val == null || val is T) {
+                    if (effectiveType == typeof(object))
+                    {
+                        yield return (T)Convert.ChangeType(val, effectiveType);
+                    } else if (val == null || val is T) {
                         yield return (T)val;
                     } else {
-                        yield return (T)Convert.ChangeType(val, typeof(T));
+                        yield return (T)Convert.ChangeType(val, effectiveType);
                     }
                 }
                 // happy path; close the reader cleanly - no
@@ -1762,10 +1784,20 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
             if (!(typeMap.ContainsKey(type) || type.IsEnum || type.FullName == LinqBinary ||
                 (type.IsValueType && (underlyingType = Nullable.GetUnderlyingType(type)) != null && underlyingType.IsEnum)))
             {
+                ITypeHandler handler;
+                if (typeHandlers.TryGetValue(type, out handler))
+                {
+                    return GetHandlerDeserializer(handler, type, startBound);
+                }
                 return GetTypeDeserializer(type, reader, startBound, length, returnNullIfFirstMissing);
             }
             return GetStructDeserializer(type, underlyingType ?? type, startBound);
 
+        }
+        static Func<IDataReader, object> GetHandlerDeserializer(ITypeHandler handler, Type type, int startBound)
+        {
+            return (IDataReader reader) =>
+                handler.Parse(type, reader.GetValue(startBound));
         }
 
 #if !CSHARP30
@@ -3169,9 +3201,10 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
                         {
                             Type dataType = reader.GetFieldType(index);
                             TypeCode dataTypeCode = Type.GetTypeCode(dataType), unboxTypeCode = Type.GetTypeCode(unboxType);
-                            if (dataType == unboxType || dataTypeCode == unboxTypeCode || dataTypeCode == Type.GetTypeCode(nullUnderlyingType))
+                            bool hasTypeHandler;
+                            if ((hasTypeHandler = typeHandlers.ContainsKey(unboxType)) || dataType == unboxType || dataTypeCode == unboxTypeCode || dataTypeCode == Type.GetTypeCode(nullUnderlyingType))
                             {
-                                if (typeHandlers.ContainsKey(unboxType))
+                                if (hasTypeHandler)
                                 {
 #pragma warning disable 618
                                     il.EmitCall(OpCodes.Call, typeof(TypeHandlerCache<>).MakeGenericType(unboxType).GetMethod("Parse"), null); // stack is now [target][target][typed-value]
@@ -3572,6 +3605,33 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
                 }
                 consumed = true;
                 var result = ReadDeferred<T>(gridIndex, deserializer.Func, typedIdentity);
+                return buffered ? result.ToList() : result;
+            }
+
+            /// <summary>
+            /// Read the next grid of results
+            /// </summary>
+#if CSHARP30
+            public IEnumerable<object> Read(Type type, bool buffered)
+#else
+            public IEnumerable<object> Read(Type type, bool buffered = true)
+#endif
+            {
+                if (type == null) throw new ArgumentNullException("type");
+                if (reader == null) throw new ObjectDisposedException(GetType().FullName, "The reader has been disposed; this can happen after all data has been consumed");
+                if (consumed) throw new InvalidOperationException("Query results must be consumed in the correct order, and each result can only be consumed once");
+                var typedIdentity = identity.ForGrid(type, gridIndex);
+                CacheInfo cache = GetCacheInfo(typedIdentity, null);
+                var deserializer = cache.Deserializer;
+
+                int hash = GetColumnHash(reader);
+                if (deserializer.Func == null || deserializer.Hash != hash)
+                {
+                    deserializer = new DeserializerState(hash, GetDeserializer(type, reader, 0, -1, false));
+                    cache.Deserializer = deserializer;
+                }
+                consumed = true;
+                var result = ReadDeferred<object>(gridIndex, deserializer.Func, typedIdentity);
                 return buffered ? result.ToList() : result;
             }
 
@@ -4054,30 +4114,35 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
                     {
                         p = (IDbDataParameter)command.Parameters[name];
                     }
+
+                    p.Direction = param.ParameterDirection;
                     if (handler == null)
                     {
                         p.Value = val ?? DBNull.Value;
-                    } else
+                        if (dbType != null && p.DbType != dbType)
+                        {
+                            p.DbType = dbType.Value;
+                        }
+                        var s = val as string;
+                        if (s != null)
+                        {
+                            if (s.Length <= 4000)
+                            {
+                                p.Size = 4000;
+                            }
+                        }
+                        if (param.Size != null)
+                        {
+                            p.Size = param.Size.Value;
+                        }                        
+                    }
+                    else
                     {
+                        if (dbType != null) p.DbType = dbType.Value;
+                        if (param.Size != null) p.Size = param.Size.Value;
                         handler.SetValue(p, val ?? DBNull.Value);
                     }
-                    p.Direction = param.ParameterDirection;
-                    var s = val as string;
-                    if (s != null)
-                    {
-                        if (s.Length <= 4000)
-                        {
-                            p.Size = 4000;
-                        }
-                    }
-                    if (param.Size != null)
-                    {
-                        p.Size = param.Size.Value;
-                    }
-                    if (dbType != null && p.DbType != dbType)
-                    {
-                        p.DbType = dbType.Value;
-                    }
+
                     if (add)
                     {
                         command.Parameters.Add(p);
