@@ -20,6 +20,7 @@ using System.Text.RegularExpressions;
 using System.Diagnostics;
 using System.Globalization;
 using System.Data.Common;
+using System.Linq.Expressions;
 
 namespace Dapper
 {
@@ -44,12 +45,27 @@ namespace Dapper
         /// Can async queries be pipelined?
         /// </summary>
         Pipelined = 2,
+        /// <summary>
+        /// Should the plan cache be bypassed?
+        /// </summary>
+        NoCache = 4,
     }
     /// <summary>
     /// Represents the key aspects of a sql operation
     /// </summary>
     public struct CommandDefinition
     {
+        internal static CommandDefinition ForCallback(object parameters)
+        {
+            if(parameters is DynamicParameters)
+            {
+                return new CommandDefinition(parameters);
+            }
+            else
+            {
+                return default(CommandDefinition);
+            }
+        }
         private readonly string commandText;
         private readonly object parameters;
         private readonly IDbTransaction transaction;
@@ -58,7 +74,13 @@ namespace Dapper
         private readonly CommandFlags flags;
 
 
-
+        internal void OnCompleted()
+        {
+            if (parameters is SqlMapper.IParameterCallbacks)
+            {
+                ((SqlMapper.IParameterCallbacks)parameters).OnCompleted();
+            }
+        }
         /// <summary>
         /// The command (sql or a stored-procedure name) to execute
         /// </summary>
@@ -84,6 +106,11 @@ namespace Dapper
         /// Should data be buffered before returning?
         /// </summary>
         public bool Buffered { get { return (flags & CommandFlags.Buffered) != 0; } }
+
+        /// <summary>
+        /// Should the plan for this query be cached?
+        /// </summary>
+        internal bool AddToCache {  get { return (flags & CommandFlags.NoCache) == 0; } }
 
         /// <summary>
         /// Additional state flags against this command
@@ -121,6 +148,11 @@ namespace Dapper
 #endif
         }
 
+        private CommandDefinition(object parameters) : this()
+        {
+            this.parameters = parameters;
+        }
+
 #if ASYNC
         private readonly CancellationToken cancellationToken;
         /// <summary>
@@ -129,12 +161,11 @@ namespace Dapper
         public CancellationToken CancellationToken { get { return cancellationToken; } }
 #endif
 
-
         internal IDbCommand SetupCommand(IDbConnection cnn, Action<IDbCommand, object> paramReader)
         {
             var cmd = cnn.CreateCommand();
-            var bindByName = GetBindByName(cmd.GetType());
-            if (bindByName != null) bindByName(cmd, true);
+            var init = GetInit(cmd.GetType());
+            if (init != null) init(cmd);
             if (transaction != null)
                 cmd.Transaction = transaction;
             cmd.CommandText = commandText;
@@ -149,36 +180,57 @@ namespace Dapper
             return cmd;
         }
 
-        static SqlMapper.Link<Type, Action<IDbCommand, bool>> bindByNameCache;
-        static Action<IDbCommand, bool> GetBindByName(Type commandType)
+        static SqlMapper.Link<Type, Action<IDbCommand>> commandInitCache;
+        static Action<IDbCommand> GetInit(Type commandType)
         {
             if (commandType == null) return null; // GIGO
-            Action<IDbCommand, bool> action;
-            if (SqlMapper.Link<Type, Action<IDbCommand, bool>>.TryGet(bindByNameCache, commandType, out action))
+            Action<IDbCommand> action;
+            if (SqlMapper.Link<Type, Action<IDbCommand>>.TryGet(commandInitCache, commandType, out action))
             {
                 return action;
             }
-            var prop = commandType.GetProperty("BindByName", BindingFlags.Public | BindingFlags.Instance);
+            var bindByName = GetBasicPropertySetter(commandType, "BindByName", typeof(bool));
+            var initialLongFetchSize = GetBasicPropertySetter(commandType, "InitialLONGFetchSize", typeof(int));
+
             action = null;
-            ParameterInfo[] indexers;
-            MethodInfo setter;
-            if (prop != null && prop.CanWrite && prop.PropertyType == typeof(bool)
-                && ((indexers = prop.GetIndexParameters()) == null || indexers.Length == 0)
-                && (setter = prop.GetSetMethod()) != null
-                )
+            if (bindByName != null || initialLongFetchSize != null)
             {
-                var method = new DynamicMethod(commandType.Name + "_BindByName", null, new Type[] { typeof(IDbCommand), typeof(bool) });
+                var method = new DynamicMethod(commandType.Name + "_init", null, new Type[] { typeof(IDbCommand) });
                 var il = method.GetILGenerator();
-                il.Emit(OpCodes.Ldarg_0);
-                il.Emit(OpCodes.Castclass, commandType);
-                il.Emit(OpCodes.Ldarg_1);
-                il.EmitCall(OpCodes.Callvirt, setter, null);
+
+                if (bindByName != null)
+                {
+                    // .BindByName = true
+                    il.Emit(OpCodes.Ldarg_0);
+                    il.Emit(OpCodes.Castclass, commandType);
+                    il.Emit(OpCodes.Ldc_I4_1);
+                    il.EmitCall(OpCodes.Callvirt, bindByName, null);
+                }
+                if (initialLongFetchSize != null)
+                {
+                    // .InitialLONGFetchSize = -1
+                    il.Emit(OpCodes.Ldarg_0);
+                    il.Emit(OpCodes.Castclass, commandType);
+                    il.Emit(OpCodes.Ldc_I4_M1);
+                    il.EmitCall(OpCodes.Callvirt, initialLongFetchSize, null);
+                }
                 il.Emit(OpCodes.Ret);
-                action = (Action<IDbCommand, bool>)method.CreateDelegate(typeof(Action<IDbCommand, bool>));
+                action = (Action<IDbCommand>)method.CreateDelegate(typeof(Action<IDbCommand>));
             }
             // cache it            
-            SqlMapper.Link<Type, Action<IDbCommand, bool>>.TryAdd(ref bindByNameCache, commandType, ref action);
+            SqlMapper.Link<Type, Action<IDbCommand>>.TryAdd(ref commandInitCache, commandType, ref action);
             return action;
+        }
+        static MethodInfo GetBasicPropertySetter(Type declaringType, string name, Type expectedType)
+        {
+            var prop = declaringType.GetProperty(name, BindingFlags.Public | BindingFlags.Instance);
+            ParameterInfo[] indexers;
+            if (prop != null && prop.CanWrite && prop.PropertyType == expectedType
+                && ((indexers = prop.GetIndexParameters()) == null || indexers.Length == 0))
+            {
+                return prop.GetSetMethod();
+            }
+            return null;
         }
 
         static SqlMapper.Link<Type, Action<IDbCommand>> deriveParamtersCache;
@@ -254,6 +306,17 @@ namespace Dapper
         }
 
         /// <summary>
+        /// Extends IDynamicParameters with facitilies for executing callbacks after commands have completed
+        /// </summary>
+        public partial interface IParameterCallbacks : IDynamicParameters
+        {
+            /// <summary>
+            /// Invoked when the command has executed
+            /// </summary>
+            void OnCompleted();
+        }
+
+        /// <summary>
         /// Implement this interface to pass an arbitrary db specific parameter to Dapper
         /// </summary>
         [AssemblyNeutral]
@@ -287,6 +350,36 @@ namespace Dapper
             /// <param name="destinationType">The type to parse to</param>
             /// <returns>The typed value</returns>
             object Parse(Type destinationType, object value);
+        }
+
+        /// <summary>
+        /// A type handler for data-types that are supported by the underlying provider, but which need
+        /// a well-known UdtTypeName to be specified
+        /// </summary>
+        public class UdtTypeHandler : ITypeHandler
+        {
+            private readonly string udtTypeName;
+            /// <summary>
+            /// Creates a new instance of UdtTypeHandler with the specified UdtTypeName
+            /// </summary>
+            public UdtTypeHandler(string udtTypeName)
+            {
+                if (string.IsNullOrEmpty(udtTypeName)) throw new ArgumentException("Cannot be null or empty", udtTypeName);
+                this.udtTypeName = udtTypeName;
+            }
+            object ITypeHandler.Parse(Type destinationType, object value)
+            {
+                return value is DBNull ? null : value;
+            }
+
+            void ITypeHandler.SetValue(IDbDataParameter parameter, object value)
+            {
+                parameter.Value = ((object)value) ?? DBNull.Value;
+                if (parameter is System.Data.SqlClient.SqlParameter)
+                {
+                    ((System.Data.SqlClient.SqlParameter)parameter).UdtTypeName = udtTypeName;
+                }
+            }
         }
 
         /// <summary>
@@ -338,6 +431,15 @@ namespace Dapper
             /// <param name="types">DataReader column types</param>
             /// <returns>Matching constructor or default one</returns>
             ConstructorInfo FindConstructor(string[] names, Type[] types);
+
+            /// <summary>
+            /// Returns a constructor which should *always* be used.
+            /// 
+            /// Parameters will be default values, nulls for reference types and zero'd for value types.
+            /// 
+            /// Use this class to force object creation away from parameterless constructors you dn't control.
+            /// </summary>
+            ConstructorInfo FindExplicitConstructor();
 
             /// <summary>
             /// Gets mapping for constructor parameter
@@ -621,7 +723,7 @@ namespace Dapper
 #endif
 
 
-        static readonly Dictionary<Type, DbType> typeMap;
+        static Dictionary<Type, DbType> typeMap;
 
         static SqlMapper()
         {
@@ -664,14 +766,31 @@ namespace Dapper
             typeMap[typeof(TimeSpan?)] = DbType.Time;
             typeMap[typeof(object)] = DbType.Object;
 
-            AddTypeHandler(typeof(DataTable), new DataTableHandler());
+            AddTypeHandlerImpl(typeof(DataTable), new DataTableHandler(), false);
+        }
+
+        /// <summary>
+        /// Clear the registered type handlers
+        /// </summary>
+        public static void ResetTypeHandlers()
+        {
+            typeHandlers = new Dictionary<Type, ITypeHandler>();
+            AddTypeHandlerImpl(typeof(DataTable), new DataTableHandler(), true);
         }
         /// <summary>
         /// Configire the specified type to be mapped to a given db-type
         /// </summary>
         public static void AddTypeMap(Type type, DbType dbType)
         {
-            typeMap[type] = dbType;
+            // use clone, mutate, replace to avoid threading issues
+            var snapshot = typeMap;
+
+            DbType oldValue;
+            if (snapshot.TryGetValue(type, out oldValue) && oldValue == dbType) return; // nothing to do
+
+            var newCopy = new Dictionary<Type, DbType>(snapshot);
+            newCopy[type] = dbType;
+            typeMap = newCopy;
         }
 
         /// <summary>
@@ -679,19 +798,64 @@ namespace Dapper
         /// </summary>
         public static void AddTypeHandler(Type type, ITypeHandler handler)
         {
+            AddTypeHandlerImpl(type, handler, true);
+        }
+
+        /// <summary>
+        /// Configire the specified type to be processed by a custom handler
+        /// </summary>
+        public static void AddTypeHandlerImpl(Type type, ITypeHandler handler, bool clone)
+        {
             if (type == null) throw new ArgumentNullException("type");
+
+            Type secondary = null;
+            if(type.IsValueType)
+            {
+                var underlying = Nullable.GetUnderlyingType(type);
+                if(underlying == null)
+                {
+                    secondary = typeof(Nullable<>).MakeGenericType(type); // the Nullable<T>
+                    // type is already the T
+                }
+                else
+                {
+                    secondary = type; // the Nullable<T>
+                    type = underlying; // the T
+                }
+            }
+
+            var snapshot = typeHandlers;
+            ITypeHandler oldValue;
+            if (snapshot.TryGetValue(type, out oldValue) && handler == oldValue) return; // nothing to do
+
+            var newCopy = clone ? new Dictionary<Type, ITypeHandler>(snapshot) : snapshot;
+
 #pragma warning disable 618
             typeof(TypeHandlerCache<>).MakeGenericType(type).GetMethod("SetHandler", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { handler });
+            if(secondary != null)
+            {
+                typeof(TypeHandlerCache<>).MakeGenericType(secondary).GetMethod("SetHandler", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { handler });
+            }
 #pragma warning restore 618
-            if (handler == null) typeHandlers.Remove(type);
-            else typeHandlers[type] = handler;
+            if (handler == null)
+            {
+                newCopy.Remove(type);
+                if (secondary != null) newCopy.Remove(secondary);
+            }
+            else
+            {
+                newCopy[type] = handler;
+                if(secondary != null) newCopy[secondary] = handler;
+            }
+            typeHandlers = newCopy;
         }
+
         /// <summary>
         /// Configire the specified type to be processed by a custom handler
         /// </summary>
         public static void AddTypeHandler<T>(TypeHandler<T> handler)
         {
-            AddTypeHandler(typeof(T), handler);
+            AddTypeHandlerImpl(typeof(T), handler, true);
         }
 
         /// <summary>
@@ -730,10 +894,23 @@ namespace Dapper
             private static ITypeHandler handler;
         }
 
-        private static readonly Dictionary<Type, ITypeHandler> typeHandlers = new Dictionary<Type, ITypeHandler>();
+        private static Dictionary<Type, ITypeHandler> typeHandlers = new Dictionary<Type, ITypeHandler>();
 
         internal const string LinqBinary = "System.Data.Linq.Binary";
-        internal static DbType? LookupDbType(Type type, string name, out ITypeHandler handler)
+
+        /// <summary>
+        /// Get the DbType that maps to a given value
+        /// </summary>
+        [Obsolete("This method is for internal use only"), Browsable(false), EditorBrowsable(EditorBrowsableState.Never)]
+        public static DbType? GetDbType(object value)
+        {
+            if (value == null || value is DBNull) return DbType.Object;
+
+            ITypeHandler handler;
+            return LookupDbType(value.GetType(), "n/a", false, out handler);
+
+        }
+        internal static DbType? LookupDbType(Type type, string name, bool demand, out ITypeHandler handler)
         {
             DbType dbType;
             handler = null;
@@ -755,13 +932,28 @@ namespace Dapper
             {
                 return DynamicParameters.EnumerableMultiParameter;
             }
+
             if (typeHandlers.TryGetValue(type, out handler))
             {
                 return DbType.Object;
             }
+            switch (type.FullName)
+            {
+                case "Microsoft.SqlServer.Types.SqlGeography":
+                    AddTypeHandler(type, handler = new UdtTypeHandler("GEOGRAPHY"));
+                    return DbType.Object;
+                case "Microsoft.SqlServer.Types.SqlGeometry":
+                    AddTypeHandler(type, handler = new UdtTypeHandler("GEOMETRY"));
+                    return DbType.Object;
+                case "Microsoft.SqlServer.Types.SqlHierarchyId":
+                    AddTypeHandler(type, handler = new UdtTypeHandler("HIERARCHYID"));
+                    return DbType.Object;
+            }
+            if(demand)
+                throw new NotSupportedException(string.Format("The member {0} of type {1} cannot be used as a parameter value", name, type.FullName));
             return null;
-        }
 
+        }
 
         /// <summary>
         /// Identity of a cached query in Dapper, used for extensability
@@ -1028,7 +1220,7 @@ namespace Dapper
 #if CSHARP30
 this IDbConnection cnn, string sql, object param, IDbTransaction transaction, int? commandTimeout, CommandType? commandType
 #else
-this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transaction = null, int? commandTimeout = null, CommandType? commandType = null
+this IDbConnection cnn, string sql, object param = null, IDbTransaction transaction = null, int? commandTimeout = null, CommandType? commandType = null
 #endif
 )
         {
@@ -1043,13 +1235,72 @@ this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transac
         {
             return ExecuteImpl(cnn, ref command);
         }
+
+
+        /// <summary>
+        /// Execute parameterized SQL that selects a single value
+        /// </summary>
+        /// <returns>The first cell selected</returns>
+        public static object ExecuteScalar(
+#if CSHARP30
+this IDbConnection cnn, string sql, object param, IDbTransaction transaction, int? commandTimeout, CommandType? commandType
+#else
+this IDbConnection cnn, string sql, object param = null, IDbTransaction transaction = null, int? commandTimeout = null, CommandType? commandType = null
+#endif
+)
+        {
+            var command = new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, CommandFlags.Buffered);
+            return ExecuteScalarImpl<object>(cnn, ref command);
+        }
+
+        /// <summary>
+        /// Execute parameterized SQL that selects a single value
+        /// </summary>
+        /// <returns>The first cell selected</returns>
+        public static T ExecuteScalar<T>(
+#if CSHARP30
+this IDbConnection cnn, string sql, object param, IDbTransaction transaction, int? commandTimeout, CommandType? commandType
+#else
+this IDbConnection cnn, string sql, object param = null, IDbTransaction transaction = null, int? commandTimeout = null, CommandType? commandType = null
+#endif
+)
+        {
+            var command = new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, CommandFlags.Buffered);
+            return ExecuteScalarImpl<T>(cnn, ref command);
+        }
+
+        /// <summary>
+        /// Execute parameterized SQL that selects a single value
+        /// </summary>
+        /// <returns>The first cell selected</returns>
+        public static object ExecuteScalar(this IDbConnection cnn, CommandDefinition command)
+        {
+            return ExecuteScalarImpl<object>(cnn, ref command);
+        }
+
+        /// <summary>
+        /// Execute parameterized SQL that selects a single value
+        /// </summary>
+        /// <returns>The first cell selected</returns>
+        public static T ExecuteScalar<T>(this IDbConnection cnn, CommandDefinition command)
+        {
+            return ExecuteScalarImpl<T>(cnn, ref command);
+        }
+
+        private static IEnumerable GetMultiExec(object param)
+        {
+            return (param is IEnumerable
+                && !(param is string || param is IEnumerable<KeyValuePair<string, object>>
+                    )) ? (IEnumerable)param : null;
+        }
+
         private static int ExecuteImpl(this IDbConnection cnn, ref CommandDefinition command)
         {
             object param = command.Parameters;
-            IEnumerable multiExec = param as IEnumerable;
+            IEnumerable multiExec = GetMultiExec(param);
             Identity identity;
             CacheInfo info = null;
-            if (multiExec != null && !(multiExec is string))
+            if (multiExec != null)
             {
 #if ASYNC
                 if((command.Flags & CommandFlags.Pipelined) != 0)
@@ -1074,7 +1325,7 @@ this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transac
                                 masterSql = cmd.CommandText;
                                 isFirst = false;
                                 identity = new Identity(command.CommandText, cmd.CommandType, cnn, null, obj.GetType(), null);
-                                info = GetCacheInfo(identity, obj);
+                                info = GetCacheInfo(identity, obj, command.AddToCache);
                             }
                             else
                             {
@@ -1085,6 +1336,7 @@ this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transac
                             total += cmd.ExecuteNonQuery();
                         }
                     }
+                    command.OnCompleted();
                 } finally
                 {
                     if (wasClosed) cnn.Close();
@@ -1096,7 +1348,7 @@ this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transac
             if (param != null)
             {
                 identity = new Identity(command.CommandText, command.CommandType, cnn, null, param.GetType(), null);
-                info = GetCacheInfo(identity, param);
+                info = GetCacheInfo(identity, param, command.AddToCache);
             }
             return ExecuteCommand(cnn, ref command, param == null ? null : info.ParamReader);
         }
@@ -1124,12 +1376,14 @@ this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transac
 #if CSHARP30
 this IDbConnection cnn, string sql, object param, IDbTransaction transaction, int? commandTimeout, CommandType? commandType
 #else
-this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transaction = null, int? commandTimeout = null, CommandType? commandType = null
+this IDbConnection cnn, string sql, object param = null, IDbTransaction transaction = null, int? commandTimeout = null, CommandType? commandType = null
 #endif
 )
         {
             var command = new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, CommandFlags.Buffered);
-            return ExecuteReaderImpl(cnn, ref command);
+            IDbCommand dbcmd;
+            var reader = ExecuteReaderImpl(cnn, ref command, CommandBehavior.Default, out dbcmd);
+            return new WrappedReader(dbcmd, reader);
         }
 
         /// <summary>
@@ -1142,14 +1396,31 @@ this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transac
         /// </remarks>
         public static IDataReader ExecuteReader(this IDbConnection cnn, CommandDefinition command)
         {
-            return ExecuteReaderImpl(cnn, ref command);
+            IDbCommand dbcmd;
+            var reader = ExecuteReaderImpl(cnn, ref command, CommandBehavior.Default, out dbcmd);
+            return new WrappedReader(dbcmd, reader);
+        }
+        /// <summary>
+        /// Execute parameterized SQL and return an <see cref="IDataReader"/>
+        /// </summary>
+        /// <returns>An <see cref="IDataReader"/> that can be used to iterate over the results of the SQL query.</returns>
+        /// <remarks>
+        /// This is typically used when the results of a query are not processed by Dapper, for example, used to fill a <see cref="DataTable"/>
+        /// or <see cref="DataSet"/>.
+        /// </remarks>
+        public static IDataReader ExecuteReader(this IDbConnection cnn, CommandDefinition command, CommandBehavior commandBehavior)
+        {
+            IDbCommand dbcmd;
+            var reader = ExecuteReaderImpl(cnn, ref command, commandBehavior, out dbcmd);
+            return new WrappedReader(dbcmd, reader);
         }
 
 #if !CSHARP30
         /// <summary>
         /// Return a list of dynamic objects, reader is closed after the call
         /// </summary>
-        public static IEnumerable<dynamic> Query(this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transaction = null, bool buffered = true, int? commandTimeout = null, CommandType? commandType = null)
+        /// <remarks>Note: each row can be accessed via "dynamic", or by casting to an IDictionary&lt;string,object&gt;</remarks>
+        public static IEnumerable<dynamic> Query(this IDbConnection cnn, string sql, object param = null, IDbTransaction transaction = null, bool buffered = true, int? commandTimeout = null, CommandType? commandType = null)
         {
             return Query<DapperRow>(cnn, sql, param as object, transaction, buffered, commandTimeout, commandType);
         }
@@ -1206,7 +1477,7 @@ this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transac
 #if CSHARP30
 this IDbConnection cnn, string sql, object param, IDbTransaction transaction, bool buffered, int? commandTimeout, CommandType? commandType
 #else
-this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transaction = null, bool buffered = true, int? commandTimeout = null, CommandType? commandType = null
+this IDbConnection cnn, string sql, object param = null, IDbTransaction transaction = null, bool buffered = true, int? commandTimeout = null, CommandType? commandType = null
 #endif
 )
         {
@@ -1256,7 +1527,7 @@ this IDbConnection cnn, Type type, string sql, object param = null, IDbTransacti
 #if CSHARP30
 this IDbConnection cnn, string sql, object param, IDbTransaction transaction, int? commandTimeout, CommandType? commandType
 #else
-            this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transaction = null, int? commandTimeout = null, CommandType? commandType = null
+            this IDbConnection cnn, string sql, object param = null, IDbTransaction transaction = null, int? commandTimeout = null, CommandType? commandType = null
 #endif
 )
         {
@@ -1274,7 +1545,7 @@ this IDbConnection cnn, string sql, object param, IDbTransaction transaction, in
         {
             object param = command.Parameters;
             Identity identity = new Identity(command.CommandText, command.CommandType, cnn, typeof(GridReader), param == null ? null : param.GetType(), null);
-            CacheInfo info = GetCacheInfo(identity, param);
+            CacheInfo info = GetCacheInfo(identity, param, command.AddToCache);
 
             IDbCommand cmd = null;
             IDataReader reader = null;
@@ -1283,9 +1554,10 @@ this IDbConnection cnn, string sql, object param, IDbTransaction transaction, in
             {
                 if (wasClosed) cnn.Open();
                 cmd = command.SetupCommand(cnn, info.ParamReader);
-                reader = cmd.ExecuteReader(wasClosed ? CommandBehavior.CloseConnection : CommandBehavior.Default);
+                reader = cmd.ExecuteReader(wasClosed ? CommandBehavior.CloseConnection | CommandBehavior.SequentialAccess : CommandBehavior.SequentialAccess);
 
-                var result = new GridReader(cmd, reader, identity);
+                var result = new GridReader(cmd, reader, identity, command.Parameters as DynamicParameters);
+                cmd = null; // now owned by result
                 wasClosed = false; // *if* the connection was closed and we got this far, then we now have a reader
                 // with the CloseConnection flag, so the reader will deal with the connection; we
                 // still need something in the "finally" to ensure that broken SQL still results
@@ -1310,7 +1582,7 @@ this IDbConnection cnn, string sql, object param, IDbTransaction transaction, in
         {
             object param = command.Parameters;
             var identity = new Identity(command.CommandText, command.CommandType, cnn, effectiveType, param == null ? null : param.GetType(), null);
-            var info = GetCacheInfo(identity, param);
+            var info = GetCacheInfo(identity, param, command.AddToCache);
 
             IDbCommand cmd = null;
             IDataReader reader = null;
@@ -1321,8 +1593,8 @@ this IDbConnection cnn, string sql, object param, IDbTransaction transaction, in
                 cmd = command.SetupCommand(cnn, info.ParamReader);
 
                 if (wasClosed) cnn.Open();
-                
-                reader = cmd.ExecuteReader(wasClosed ? CommandBehavior.CloseConnection : CommandBehavior.Default);
+                reader = cmd.ExecuteReader(wasClosed ? CommandBehavior.CloseConnection | CommandBehavior.SequentialAccess : CommandBehavior.SequentialAccess);
+
                 wasClosed = false; // *if* the connection was closed and we got this far, then we now have a reader
                 // with the CloseConnection flag, so the reader will deal with the connection; we
                 // still need something in the "finally" to ensure that broken SQL still results
@@ -1331,28 +1603,30 @@ this IDbConnection cnn, string sql, object param, IDbTransaction transaction, in
                 int hash = GetColumnHash(reader);
                 if (tuple.Func == null || tuple.Hash != hash)
                 {
+                    if (reader.FieldCount == 0) //https://code.google.com/p/dapper-dot-net/issues/detail?id=57
+                        yield break;
                     tuple = info.Deserializer = new DeserializerState(hash, GetDeserializer(effectiveType, reader, 0, -1, false));
-                    SetQueryCache(identity, info);
+                    if(command.AddToCache) SetQueryCache(identity, info);
                 }
 
                 var func = tuple.Func;
-
+                var convertToType = Nullable.GetUnderlyingType(effectiveType) ?? effectiveType;
                 while (reader.Read())
                 {
                     object val = func(reader);
-                    if (effectiveType == typeof(object))
-                    {
-                        yield return (T)Convert.ChangeType(val, effectiveType);
-                    } else if (val == null || val is T) {
+					if (val == null || val is T) {
                         yield return (T)val;
                     } else {
-                        yield return (T)Convert.ChangeType(val, effectiveType);
+                        yield return (T)Convert.ChangeType(val, convertToType, CultureInfo.InvariantCulture);
                     }
                 }
+                while (reader.NextResult()) { }
                 // happy path; close the reader cleanly - no
                 // need for "Cancel" etc
                 reader.Dispose();
                 reader = null;
+
+                command.OnCompleted();
             }
             finally
             {
@@ -1387,7 +1661,7 @@ this IDbConnection cnn, string sql, object param, IDbTransaction transaction, in
 #if CSHARP30
 this IDbConnection cnn, string sql, Func<TFirst, TSecond, TReturn> map, object param, IDbTransaction transaction, bool buffered, string splitOn, int? commandTimeout, CommandType? commandType
 #else
-this IDbConnection cnn, string sql, Func<TFirst, TSecond, TReturn> map, dynamic param = null, IDbTransaction transaction = null, bool buffered = true, string splitOn = "Id", int? commandTimeout = null, CommandType? commandType = null
+this IDbConnection cnn, string sql, Func<TFirst, TSecond, TReturn> map, object param = null, IDbTransaction transaction = null, bool buffered = true, string splitOn = "Id", int? commandTimeout = null, CommandType? commandType = null
 #endif
 )
         {
@@ -1415,7 +1689,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TReturn> map, dynamic 
 #if CSHARP30
 this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TReturn> map, object param, IDbTransaction transaction, bool buffered, string splitOn, int? commandTimeout, CommandType? commandType
 #else
-this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TReturn> map, dynamic param = null, IDbTransaction transaction = null, bool buffered = true, string splitOn = "Id", int? commandTimeout = null, CommandType? commandType = null
+this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TReturn> map, object param = null, IDbTransaction transaction = null, bool buffered = true, string splitOn = "Id", int? commandTimeout = null, CommandType? commandType = null
 #endif
 )
         {
@@ -1444,7 +1718,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TReturn> map, 
 #if CSHARP30
 this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TReturn> map, object param, IDbTransaction transaction, bool buffered, string splitOn, int? commandTimeout, CommandType? commandType
 #else
-this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TReturn> map, dynamic param = null, IDbTransaction transaction = null, bool buffered = true, string splitOn = "Id", int? commandTimeout = null, CommandType? commandType = null
+this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TReturn> map, object param = null, IDbTransaction transaction = null, bool buffered = true, string splitOn = "Id", int? commandTimeout = null, CommandType? commandType = null
 #endif
 )
         {
@@ -1472,7 +1746,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
         /// <param name="commandType"></param>
         /// <returns></returns>
         public static IEnumerable<TReturn> Query<TFirst, TSecond, TThird, TFourth, TFifth, TReturn>(
-            this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TFifth, TReturn> map, dynamic param = null, IDbTransaction transaction = null, bool buffered = true, string splitOn = "Id", int? commandTimeout = null, CommandType? commandType = null
+            this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TFifth, TReturn> map, object param = null, IDbTransaction transaction = null, bool buffered = true, string splitOn = "Id", int? commandTimeout = null, CommandType? commandType = null
 )
         {
             return MultiMap<TFirst, TSecond, TThird, TFourth, TFifth, DontMap, DontMap, TReturn>(cnn, sql, map, param as object, transaction, buffered, splitOn, commandTimeout, commandType);
@@ -1499,7 +1773,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
         /// <param name="commandType"></param>
         /// <returns></returns>
         public static IEnumerable<TReturn> Query<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TReturn>(
-            this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TReturn> map, dynamic param = null, IDbTransaction transaction = null, bool buffered = true, string splitOn = "Id", int? commandTimeout = null, CommandType? commandType = null
+            this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TReturn> map, object param = null, IDbTransaction transaction = null, bool buffered = true, string splitOn = "Id", int? commandTimeout = null, CommandType? commandType = null
 )
         {
             return MultiMap<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, DontMap, TReturn>(cnn, sql, map, param as object, transaction, buffered, splitOn, commandTimeout, commandType);
@@ -1527,9 +1801,31 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
         /// <param name="commandTimeout"></param>
         /// <param name="commandType"></param>
         /// <returns></returns>
-        public static IEnumerable<TReturn> Query<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn> map, dynamic param = null, IDbTransaction transaction = null, bool buffered = true, string splitOn = "Id", int? commandTimeout = null, CommandType? commandType = null)
+        public static IEnumerable<TReturn> Query<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn> map, object param = null, IDbTransaction transaction = null, bool buffered = true, string splitOn = "Id", int? commandTimeout = null, CommandType? commandType = null)
         {
             return MultiMap<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(cnn, sql, map, param as object, transaction, buffered, splitOn, commandTimeout, commandType);
+        }
+
+        /// <summary>
+        /// Perform a multi mapping query with arbitrary input parameters
+        /// </summary>
+        /// <typeparam name="TReturn">The return type</typeparam>
+        /// <param name="cnn"></param>
+        /// <param name="sql"></param>
+        /// <param name="types">array of types in the recordset</param>
+        /// <param name="map"></param>
+        /// <param name="param"></param>
+        /// <param name="transaction"></param>
+        /// <param name="buffered"></param>
+        /// <param name="splitOn">The Field we should split and read the second object from (default: id)</param>
+        /// <param name="commandTimeout">Number of seconds before command execution timeout</param>
+        /// <param name="commandType">Is it a stored proc or a batch?</param>
+        /// <returns></returns>
+        public static IEnumerable<TReturn> Query<TReturn>(this IDbConnection cnn, string sql, Type[] types, Func<object[], TReturn> map, dynamic param = null, IDbTransaction transaction = null, bool buffered = true, string splitOn = "Id", int? commandTimeout = null, CommandType? commandType = null)
+        {
+            var command = new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, buffered ? CommandFlags.Buffered : CommandFlags.None);
+            var results = MultiMapImpl<TReturn>(cnn, command, types, map, splitOn, null, null, true);
+            return buffered ? results.ToList() : results;
         }
 #endif
         partial class DontMap { }
@@ -1537,15 +1833,86 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
             this IDbConnection cnn, string sql, Delegate map, object param, IDbTransaction transaction, bool buffered, string splitOn, int? commandTimeout, CommandType? commandType)
         {
             var command = new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, buffered ? CommandFlags.Buffered : CommandFlags.None);
-            var results = MultiMapImpl<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(cnn, command, map, splitOn, null, null);
+            var results = MultiMapImpl<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(cnn, command, map, splitOn, null, null, true);
             return buffered ? results.ToList() : results;
         }
 
-        static IEnumerable<TReturn> MultiMapImpl<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(this IDbConnection cnn, CommandDefinition command, Delegate map, string splitOn, IDataReader reader, Identity identity)
+        static IEnumerable<TReturn> MultiMapImpl<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(this IDbConnection cnn, CommandDefinition command, Delegate map, string splitOn, IDataReader reader, Identity identity, bool finalize)
         {
             object param = command.Parameters;
             identity = identity ?? new Identity(command.CommandText, command.CommandType, cnn, typeof(TFirst), param == null ? null : param.GetType(), new[] { typeof(TFirst), typeof(TSecond), typeof(TThird), typeof(TFourth), typeof(TFifth), typeof(TSixth), typeof(TSeventh) });
-            CacheInfo cinfo = GetCacheInfo(identity, param);
+            CacheInfo cinfo = GetCacheInfo(identity, param, command.AddToCache);
+
+            IDbCommand ownedCommand = null;
+            IDataReader ownedReader = null;
+
+            bool wasClosed = cnn != null && cnn.State == ConnectionState.Closed;
+            try
+            {
+                if (reader == null)
+                {
+                    ownedCommand = command.SetupCommand(cnn, cinfo.ParamReader);
+                    if (wasClosed) cnn.Open();
+                    ownedReader = ownedCommand.ExecuteReader(wasClosed ? CommandBehavior.CloseConnection | CommandBehavior.SequentialAccess : CommandBehavior.SequentialAccess);
+                    reader = ownedReader;
+                }
+                DeserializerState deserializer = default(DeserializerState);
+                Func<IDataReader, object>[] otherDeserializers = null;
+
+                int hash = GetColumnHash(reader);
+                if ((deserializer = cinfo.Deserializer).Func == null || (otherDeserializers = cinfo.OtherDeserializers) == null || hash != deserializer.Hash)
+                {
+                    var deserializers = GenerateDeserializers(new Type[] { typeof(TFirst), typeof(TSecond), typeof(TThird), typeof(TFourth), typeof(TFifth), typeof(TSixth), typeof(TSeventh) }, splitOn, reader);
+                    deserializer = cinfo.Deserializer = new DeserializerState(hash, deserializers[0]);
+                    otherDeserializers = cinfo.OtherDeserializers = deserializers.Skip(1).ToArray();
+                    if(command.AddToCache) SetQueryCache(identity, cinfo);
+                }
+
+                Func<IDataReader, TReturn> mapIt = GenerateMapper<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(deserializer.Func, otherDeserializers, map);
+
+                if (mapIt != null)
+                {
+                    while (reader.Read())
+                    {
+                        yield return mapIt(reader);
+                    }
+                    if(finalize)
+                    {
+                        while (reader.NextResult()) { }
+                        command.OnCompleted();
+                    }                    
+                }
+            }
+            finally
+            {
+                try
+                {
+                    if (ownedReader != null)
+                    {
+                        ownedReader.Dispose();
+                    }
+                }
+                finally
+                {
+                    if (ownedCommand != null)
+                    {
+                        ownedCommand.Dispose();
+                    }
+                    if (wasClosed) cnn.Close();
+                }
+            }
+        }
+
+        static IEnumerable<TReturn> MultiMapImpl<TReturn>(this IDbConnection cnn, CommandDefinition command, Type[] types, Func<object[], TReturn> map, string splitOn, IDataReader reader, Identity identity, bool finalize)
+        {
+            if (types.Length < 1)
+            {
+                throw new ArgumentException("you must provide at least one type to deserialize");
+            }
+
+            object param = command.Parameters;
+            identity = identity ?? new Identity(command.CommandText, command.CommandType, cnn, types[0], param == null ? null : param.GetType(), types);
+            CacheInfo cinfo = GetCacheInfo(identity, param, command.AddToCache);
 
             IDbCommand ownedCommand = null;
             IDataReader ownedReader = null;
@@ -1566,19 +1933,24 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                 int hash = GetColumnHash(reader);
                 if ((deserializer = cinfo.Deserializer).Func == null || (otherDeserializers = cinfo.OtherDeserializers) == null || hash != deserializer.Hash)
                 {
-                    var deserializers = GenerateDeserializers(new Type[] { typeof(TFirst), typeof(TSecond), typeof(TThird), typeof(TFourth), typeof(TFifth), typeof(TSixth), typeof(TSeventh) }, splitOn, reader);
+                    var deserializers = GenerateDeserializers(types, splitOn, reader);
                     deserializer = cinfo.Deserializer = new DeserializerState(hash, deserializers[0]);
                     otherDeserializers = cinfo.OtherDeserializers = deserializers.Skip(1).ToArray();
                     SetQueryCache(identity, cinfo);
                 }
 
-                Func<IDataReader, TReturn> mapIt = GenerateMapper<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(deserializer.Func, otherDeserializers, map);
+                Func<IDataReader, TReturn> mapIt = GenerateMapper(types.Length, deserializer.Func, otherDeserializers, map);
 
                 if (mapIt != null)
                 {
                     while (reader.Read())
                     {
                         yield return mapIt(reader);
+                    }
+                    if (finalize)
+                    {
+                        while (reader.NextResult()) { }
+                        command.OnCompleted();
                     }
                 }
             }
@@ -1623,6 +1995,22 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                 default:
                     throw new NotSupportedException();
             }
+        }
+
+        private static Func<IDataReader, TReturn> GenerateMapper<TReturn>(int length, Func<IDataReader, object> deserializer, Func<IDataReader, object>[] otherDeserializers, Func<object[], TReturn> map)
+        {
+            return r =>
+            {
+                var objects = new object[length];
+                objects[0] = deserializer(r);
+
+                for (var i = 1; i < length; ++i)
+                {
+                    objects[i] = otherDeserializers[i - 1](r);
+                }
+
+                return map(objects);
+            };
         }
 
         private static Func<IDataReader, object>[] GenerateDeserializers(Type[] types, string splitOn, IDataReader reader)
@@ -1694,7 +2082,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
         {
             if (startIdx == reader.FieldCount)
             {
-                throw new ArgumentException(MultiMapSplitExceptionMessage);
+                throw MultiMapException(reader);
             }
 
             if (splitOn == "*")
@@ -1728,10 +2116,10 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                 }
             }
 
-            throw new ArgumentException(MultiMapSplitExceptionMessage);
+            throw MultiMapException(reader);
         }
 
-        private static CacheInfo GetCacheInfo(Identity identity, object exampleParameters)
+        private static CacheInfo GetCacheInfo(Identity identity, object exampleParameters, bool addToCache)
         {
             CacheInfo info;
             if (!TryGetQueryCache(identity, out info))
@@ -1739,30 +2127,85 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                 info = new CacheInfo();
                 if (identity.parametersType != null)
                 {
+                    Action<IDbCommand, object> reader;
                     if (exampleParameters is IDynamicParameters)
                     {
-                        info.ParamReader = (cmd, obj) => { ((IDynamicParameters)obj).AddParameters(cmd, identity); };
+                        reader = (cmd, obj) => { ((IDynamicParameters)obj).AddParameters(cmd, identity); };
                     }
-#if !CSHARP30
-                    // special-case dictionary && `dynamic`
-                    else if (exampleParameters is IEnumerable<KeyValuePair<string, object>> && exampleParameters is System.Dynamic.IDynamicMetaObjectProvider)
+                    else if (exampleParameters is IEnumerable<KeyValuePair<string, object>>)
                     {
-                        info.ParamReader = (cmd, obj) =>
+                        reader = (cmd, obj) =>
                         {
                             IDynamicParameters mapped = new DynamicParameters(obj);
                             mapped.AddParameters(cmd, identity);
                         };
                     }
-#endif
                     else
                     {
                         var literals = GetLiteralTokens(identity.sql);
-                        info.ParamReader = CreateParamInfoGenerator(identity, false, true, literals);
+                        reader = CreateParamInfoGenerator(identity, false, true, literals);
                     }
+                    if((identity.commandType == null || identity.commandType == CommandType.Text) && ShouldPassByPosition(identity.sql))
+                    {
+                        var tail = reader;
+                        var sql = identity.sql;
+                        reader = (cmd, obj) =>
+                        {
+                            tail(cmd, obj);
+                            PassByPosition(cmd);
+                        };
+                    }
+                    info.ParamReader = reader;
                 }
-                SetQueryCache(identity, info);
+                if(addToCache) SetQueryCache(identity, info);
             }
             return info;
+        }
+
+        private static bool ShouldPassByPosition(string sql)
+        {
+            return sql != null && sql.IndexOf('?') >= 0 && pseudoPositional.IsMatch(sql);
+        }
+
+        private static void PassByPosition(IDbCommand cmd)
+        {
+            if (cmd.Parameters.Count == 0) return;
+
+            Dictionary<string, IDbDataParameter> parameters = new Dictionary<string, IDbDataParameter>(StringComparer.InvariantCulture);
+            
+            foreach(IDbDataParameter param in cmd.Parameters)
+            {
+                if (!string.IsNullOrEmpty(param.ParameterName)) parameters[param.ParameterName] = param;
+            }
+            HashSet<string> consumed = new HashSet<string>(StringComparer.InvariantCulture);
+            bool firstMatch = true;
+            cmd.CommandText = pseudoPositional.Replace(cmd.CommandText, match =>
+            {
+                string key = match.Groups[1].Value;
+                IDbDataParameter param;
+                if (!consumed.Add(key))
+                {
+                    throw new InvalidOperationException("When passing parameters by position, each parameter can only be referenced once");
+                }
+                else if (parameters.TryGetValue(key, out param))
+                {
+                    if(firstMatch)
+                    {
+                        firstMatch = false;
+                        cmd.Parameters.Clear(); // only clear if we are pretty positive that we've found this pattern successfully
+                    }
+                    // if found, return the anonymous token "?"
+                    cmd.Parameters.Add(param);
+                    parameters.Remove(key);
+                    consumed.Add(key);
+                    return "?";
+                }
+                else
+                {
+                    // otherwise, leave alone for simple debugging
+                    return match.Value;
+                }
+            });
         }
 
         private static Func<IDataReader, object> GetDeserializer(Type type, IDataReader reader, int startBound, int length, bool returnNullIfFirstMissing)
@@ -1792,7 +2235,6 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                 return GetTypeDeserializer(type, reader, startBound, length, returnNullIfFirstMissing);
             }
             return GetStructDeserializer(type, underlyingType ?? type, startBound);
-
         }
         static Func<IDataReader, object> GetHandlerDeserializer(ITypeHandler handler, Type type, int startBound)
         {
@@ -1975,7 +2417,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
 
             public override string ToString()
             {
-                var sb = new StringBuilder("{DapperRow");
+                var sb = GetStringBuilder().Append("{DapperRow");
                 foreach (var kv in this)
                 {
                     var value = kv.Value;
@@ -1990,7 +2432,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                     }
                 }
 
-                return sb.Append('}').ToString();
+                return sb.Append('}').__ToStringRecycle();
             }
 
             System.Dynamic.DynamicMetaObject System.Dynamic.IDynamicMetaObjectProvider.GetMetaObject(
@@ -2130,7 +2572,18 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
 #endregion
         }
 #endif
-        private const string MultiMapSplitExceptionMessage = "When using the multi-mapping APIs ensure you set the splitOn param if you have keys other than Id";
+        private static Exception MultiMapException(IDataRecord reader)
+        {
+            bool hasFields = false;
+            try {
+                hasFields = reader != null && reader.FieldCount != 0;
+            } catch { }
+            if (hasFields)
+                return new ArgumentException("When using the multi-mapping APIs ensure you set the splitOn param if you have keys other than Id", "splitOn");
+            else
+                return new InvalidOperationException("No columns were selected");
+        }
+        
 #if !CSHARP30
         internal static Func<IDataReader, object> GetDapperRowDeserializer(IDataRecord reader, int startBound, int length, bool returnNullIfFirstMissing)
         {
@@ -2142,7 +2595,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
 
             if (fieldCount <= startBound)
             {
-                throw new ArgumentException(MultiMapSplitExceptionMessage, "splitOn");
+                throw MultiMapException(reader);
             }
 
             var effectiveFieldCount = Math.Min(fieldCount - startBound, length);
@@ -2202,7 +2655,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
 
             if (fieldCount <= startBound)
             {
-                throw new ArgumentException(MultiMapSplitExceptionMessage, "splitOn");
+                throw MultiMapException(reader);
             }
 
             return
@@ -2283,96 +2736,92 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
             // initially we tried TVP, however it performs quite poorly.
             // keep in mind SQL support up to 2000 params easily in sp_executesql, needing more is rare
 
-            var list = value as IEnumerable;
-            var count = 0;
-
-            if (list != null)
+            if (FeatureSupport.Get(command.Connection).Arrays)
             {
-                if (FeatureSupport.Get(command.Connection).Arrays)
+                var arrayParm = command.CreateParameter();
+                arrayParm.Value = value ?? DBNull.Value;
+                arrayParm.ParameterName = namePrefix;
+                command.Parameters.Add(arrayParm);
+            }
+            else
+            {
+                var list = value as IEnumerable;
+                var count = 0;
+                bool isString = value is IEnumerable<string>;
+                bool isDbString = value is IEnumerable<DbString>;
+                foreach (var item in list)
                 {
-                    var arrayParm = command.CreateParameter();
-                    arrayParm.Value = list;
-                    arrayParm.ParameterName = namePrefix;
-                    command.Parameters.Add(arrayParm);
-                }
-                else
-                {
-                    bool isString = value is IEnumerable<string>;
-                    bool isDbString = value is IEnumerable<DbString>;
-                    foreach (var item in list)
+                    count++;
+                    var listParam = command.CreateParameter();
+                    listParam.ParameterName = namePrefix + count;
+                    if (isString)
                     {
-                        count++;
-                        var listParam = command.CreateParameter();
-                        listParam.ParameterName = namePrefix + count;
-                        listParam.Value = item ?? DBNull.Value;
-                        if (isString)
+                        listParam.Size = DbString.DefaultLength;
+                        if (item != null && ((string)item).Length > DbString.DefaultLength)
                         {
-                            listParam.Size = 4000;
-                            if (item != null && ((string)item).Length > 4000)
-                            {
-                                listParam.Size = -1;
-                            }
-                        }
-                        if (isDbString && item as DbString != null)
-                        {
-                            var str = item as DbString;
-                            str.AddParameter(command, listParam.ParameterName);
-                        }
-                        else
-                        {
-                            command.Parameters.Add(listParam);
+                            listParam.Size = -1;
                         }
                     }
-
-                    var regexIncludingUnknown = @"([?@:]" + Regex.Escape(namePrefix) + @")(\s+(?i)unknown(?-i))?";
-                    if (count == 0)
+                    if (isDbString && item as DbString != null)
                     {
-                        command.CommandText = Regex.Replace(command.CommandText, regexIncludingUnknown, match =>
-                        {
-                            var variableName = match.Groups[1].Value;
-                            if (match.Groups[2].Success)
-                            {
-                                // looks like an optimize hint; leave it alone!
-                                return match.Value;
-                            }
-                            else
-                            {
-                                return "(SELECT " + variableName + " WHERE 1 = 0)";
-                            }
-                        });                        
-                        var dummyParam = command.CreateParameter();
-                        dummyParam.ParameterName = namePrefix;
-                        dummyParam.Value = DBNull.Value;
-                        command.Parameters.Add(dummyParam);
+                        var str = item as DbString;
+                        str.AddParameter(command, listParam.ParameterName);
                     }
                     else
                     {
-                        command.CommandText = Regex.Replace(command.CommandText, regexIncludingUnknown, match =>
-                        {
-                            var variableName = match.Groups[1].Value;
-                            if (match.Groups[2].Success)
-                            {
-                                // looks like an optimize hint; expand it
-                                var suffix = match.Groups[2].Value;
-                                
-                                var sb = new StringBuilder(variableName).Append(1).Append(suffix);
-                                for (int i = 2; i <= count; i++)
-                                {
-                                    sb.Append(',').Append(variableName).Append(i).Append(suffix);
-                                }
-                                return sb.ToString();
-                            }
-                            else
-                            {
-                                var sb = new StringBuilder("(").Append(variableName).Append(1);
-                                for (int i = 2; i <= count; i++)
-                                {
-                                    sb.Append(',').Append(variableName).Append(i);
-                                }
-                                return sb.Append(')').ToString();
-                            }
-                        });
+                        listParam.Value = item ?? DBNull.Value;
+                        command.Parameters.Add(listParam);
                     }
+                }
+
+                var regexIncludingUnknown = @"([?@:]" + Regex.Escape(namePrefix) + @")(?!\w)(\s+(?i)unknown(?-i))?";
+                if (count == 0)
+                {
+                    command.CommandText = Regex.Replace(command.CommandText, regexIncludingUnknown, match =>
+                    {
+                        var variableName = match.Groups[1].Value;
+                        if (match.Groups[2].Success)
+                        {
+                            // looks like an optimize hint; leave it alone!
+                            return match.Value;
+                        }
+                        else
+                        {
+                            return "(SELECT " + variableName + " WHERE 1 = 0)";
+                        }
+                    });                        
+                    var dummyParam = command.CreateParameter();
+                    dummyParam.ParameterName = namePrefix;
+                    dummyParam.Value = DBNull.Value;
+                    command.Parameters.Add(dummyParam);
+                }
+                else
+                {
+                    command.CommandText = Regex.Replace(command.CommandText, regexIncludingUnknown, match =>
+                    {
+                        var variableName = match.Groups[1].Value;
+                        if (match.Groups[2].Success)
+                        {
+                            // looks like an optimize hint; expand it
+                            var suffix = match.Groups[2].Value;
+                                
+                            var sb = GetStringBuilder().Append(variableName).Append(1).Append(suffix);
+                            for (int i = 2; i <= count; i++)
+                            {
+                                sb.Append(',').Append(variableName).Append(i).Append(suffix);
+                            }
+                            return sb.__ToStringRecycle();
+                        }
+                        else
+                        {
+                            var sb = GetStringBuilder().Append('(').Append(variableName).Append(1);
+                            for (int i = 2; i <= count; i++)
+                            {
+                                sb.Append(',').Append(variableName).Append(i);
+                            }
+                            return sb.Append(')').__ToStringRecycle();
+                        }
+                    });
                 }
             }
 
@@ -2380,14 +2829,14 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
 
         private static IEnumerable<PropertyInfo> FilterParameters(IEnumerable<PropertyInfo> parameters, string sql)
         {
-            return parameters.Where(p => Regex.IsMatch(sql, @"[?@:]" + p.Name + "([^a-zA-Z0-9_]+|$)", RegexOptions.IgnoreCase | RegexOptions.Multiline | RegexOptions.CultureInvariant));
+            return parameters.Where(p => Regex.IsMatch(sql, @"[?@:]" + p.Name + "([^a-z0-9_]+|$)", RegexOptions.IgnoreCase | RegexOptions.Multiline | RegexOptions.CultureInvariant));
         }
 
-
         // look for ? / @ / : *by itself*
-        static readonly Regex smellsLikeOleDb = new Regex(@"(?<![a-zA-Z0-9_])[?@:](?![a-zA-Z0-9_])", RegexOptions.IgnoreCase | RegexOptions.Multiline | RegexOptions.CultureInvariant | RegexOptions.Compiled),
-            literalTokens = new Regex(@"\{=([a-zA-Z0-9_]+)\}", RegexOptions.IgnoreCase | RegexOptions.Multiline | RegexOptions.CultureInvariant | RegexOptions.Compiled);
-        
+        static readonly Regex smellsLikeOleDb = new Regex(@"(?<![a-z0-9@_])[?@:](?![a-z0-9@_])", RegexOptions.IgnoreCase | RegexOptions.Multiline | RegexOptions.CultureInvariant | RegexOptions.Compiled),
+            literalTokens = new Regex(@"(?<![a-z0-9_])\{=([a-z0-9_]+)\}", RegexOptions.IgnoreCase | RegexOptions.Multiline | RegexOptions.CultureInvariant | RegexOptions.Compiled),
+            pseudoPositional = new Regex(@"\?([a-z_][a-z0-9_]*)\?", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
         /// <summary>
         /// Represents a placeholder for a value that should be replaced as a literal value in the resulting sql
         /// </summary>
@@ -2463,14 +2912,23 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                     case TypeCode.Decimal:
                         return ((decimal)value).ToString(CultureInfo.InvariantCulture);
                     default:
-                        if(value is IEnumerable && !(value is string))
+                        var multiExec = GetMultiExec(value);
+                        if(multiExec != null)
                         {
-                            var sb = new StringBuilder();
+                            StringBuilder sb = null;
                             bool first = true;
-                            foreach (object subval in (IEnumerable)value)
+                            foreach (object subval in multiExec)
                             {
-                                sb.Append(first ? '(' : ',').Append(Format(subval));
-                                first = false;
+                                if(first)
+                                {
+                                    sb = GetStringBuilder().Append('(');
+                                    first = false;
+                                }
+                                else
+                                {
+                                    sb.Append(',');
+                                }
+                                sb.Append(Format(subval));
                             }
                             if(first)
                             {
@@ -2478,7 +2936,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                             }
                             else
                             {
-                                return sb.Append(')').ToString();
+                                return sb.Append(')').__ToStringRecycle();
                             }
                         }
                         throw new NotSupportedException(value.GetType().Name);
@@ -2541,10 +2999,19 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
 
             var il = dm.GetILGenerator();
 
-            il.DeclareLocal(type); // 0
+            bool isStruct = type.IsValueType;
             bool haveInt32Arg1 = false;
             il.Emit(OpCodes.Ldarg_1); // stack is now [untyped-param]
-            il.Emit(OpCodes.Unbox_Any, type); // stack is now [typed-param]
+            if (isStruct)
+            {
+                il.DeclareLocal(type.MakePointerType());
+                il.Emit(OpCodes.Unbox, type); // stack is now [typed-param]
+            }
+            else
+            {
+                il.DeclareLocal(type); // 0
+                il.Emit(OpCodes.Castclass, type); // stack is now [typed-param]
+            }
             il.Emit(OpCodes.Stloc_0);// stack is now empty
 
             il.Emit(OpCodes.Ldarg_0); // stack is now [command]
@@ -2607,12 +3074,13 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                 props = FilterParameters(props, identity.sql);
             }
 
+            var callOpCode = isStruct ? OpCodes.Call : OpCodes.Callvirt;
             foreach (var prop in props)
             {
                 if (typeof(ICustomQueryParameter).IsAssignableFrom(prop.PropertyType))
                 {
                     il.Emit(OpCodes.Ldloc_0); // stack is now [parameters] [typed-param]
-                    il.Emit(OpCodes.Callvirt, prop.GetGetMethod()); // stack is [parameters] [custom]
+                    il.Emit(callOpCode, prop.GetGetMethod()); // stack is [parameters] [custom]
                     il.Emit(OpCodes.Ldarg_0); // stack is now [parameters] [custom] [command]
                     il.Emit(OpCodes.Ldstr, prop.Name); // stack is now [parameters] [custom] [command] [name]
                     il.EmitCall(OpCodes.Callvirt, prop.PropertyType.GetMethod("AddParameter"), null); // stack is now [parameters]
@@ -2620,8 +3088,8 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                 }
 
                 ITypeHandler handler;
-                DbType? dbType = LookupDbType(prop.PropertyType, prop.Name, out handler);
-                if (dbType == null) { continue; }
+                DbType? dbType = LookupDbType(prop.PropertyType, prop.Name, false, out handler);
+                if (dbType == null) continue;
 
                 if (dbType == DynamicParameters.EnumerableMultiParameter)
                 {
@@ -2629,7 +3097,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                     il.Emit(OpCodes.Ldarg_0); // stack is now [parameters] [command]
                     il.Emit(OpCodes.Ldstr, prop.Name); // stack is now [parameters] [command] [name]
                     il.Emit(OpCodes.Ldloc_0); // stack is now [parameters] [command] [name] [typed-param]
-                    il.Emit(OpCodes.Callvirt, prop.GetGetMethod()); // stack is [parameters] [command] [name] [typed-value]
+                    il.Emit(callOpCode, prop.GetGetMethod()); // stack is [parameters] [command] [name] [typed-value]
                     if (prop.PropertyType.IsValueType)
                     {
                         il.Emit(OpCodes.Box, prop.PropertyType); // stack is [parameters] [command] [name] [boxed-value]
@@ -2659,8 +3127,18 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                 if (dbType != DbType.Time && handler == null) // https://connect.microsoft.com/VisualStudio/feedback/details/381934/sqlparameter-dbtype-dbtype-time-sets-the-parameter-to-sqldbtype-datetime-instead-of-sqldbtype-time
                 {
                     il.Emit(OpCodes.Dup);// stack is now [parameters] [[parameters]] [parameter] [parameter]
-                    EmitInt32(il, (int)dbType);// stack is now [parameters] [[parameters]] [parameter] [parameter] [db-type]
-
+                    if (dbType == DbType.Object && prop.PropertyType == typeof(object)) // includes dynamic
+                    {
+                        // look it up from the param value
+                        il.Emit(OpCodes.Ldloc_0); // stack is now [parameters] [[parameters]] [parameter] [parameter] [typed-param]
+                        il.Emit(callOpCode, prop.GetGetMethod()); // stack is [parameters] [[parameters]] [parameter] [parameter] [object-value]
+                        il.Emit(OpCodes.Call, typeof(SqlMapper).GetMethod("GetDbType", BindingFlags.Static | BindingFlags.Public)); // stack is now [parameters] [[parameters]] [parameter] [parameter] [db-type]
+                    }
+                    else
+                    {
+                        // constant value; nice and simple
+                        EmitInt32(il, (int)dbType);// stack is now [parameters] [[parameters]] [parameter] [parameter] [db-type]
+                    }
                     il.EmitCall(OpCodes.Callvirt, typeof(IDataParameter).GetProperty("DbType").GetSetMethod(), null);// stack is now [parameters] [[parameters]] [parameter]
                 }
 
@@ -2670,7 +3148,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
 
                 il.Emit(OpCodes.Dup);// stack is now [parameters] [[parameters]] [parameter] [parameter]
                 il.Emit(OpCodes.Ldloc_0); // stack is now [parameters] [[parameters]] [parameter] [parameter] [typed-param]
-                il.Emit(OpCodes.Callvirt, prop.GetGetMethod()); // stack is [parameters] [[parameters]] [parameter] [parameter] [typed-value]
+                il.Emit(callOpCode, prop.GetGetMethod()); // stack is [parameters] [[parameters]] [parameter] [parameter] [typed-value]
                 bool checkForNull = true;
                 if (prop.PropertyType.IsValueType)
                 {
@@ -2682,7 +3160,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                 }
                 if (checkForNull)
                 {
-                    if (dbType == DbType.String && !haveInt32Arg1)
+                    if ((dbType == DbType.String || dbType == DbType.AnsiString) && !haveInt32Arg1)
                     {
                         il.DeclareLocal(typeof(int));
                         haveInt32Arg1 = true;
@@ -2690,12 +3168,12 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                     // relative stack: [boxed value]
                     il.Emit(OpCodes.Dup);// relative stack: [boxed value] [boxed value]
                     Label notNull = il.DefineLabel();
-                    Label? allDone = dbType == DbType.String ? il.DefineLabel() : (Label?)null;
+                    Label? allDone = (dbType == DbType.String || dbType == DbType.AnsiString) ? il.DefineLabel() : (Label?)null;
                     il.Emit(OpCodes.Brtrue_S, notNull);
                     // relative stack [boxed value = null]
                     il.Emit(OpCodes.Pop); // relative stack empty
                     il.Emit(OpCodes.Ldsfld, typeof(DBNull).GetField("Value")); // relative stack [DBNull]
-                    if (dbType == DbType.String)
+                    if (dbType == DbType.String || dbType == DbType.AnsiString)
                     {
                         EmitInt32(il, 0);
                         il.Emit(OpCodes.Stloc_1);
@@ -2706,11 +3184,11 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                     {
                         il.Emit(OpCodes.Dup); // [string] [string]
                         il.EmitCall(OpCodes.Callvirt, typeof(string).GetProperty("Length").GetGetMethod(), null); // [string] [length]
-                        EmitInt32(il, 4000); // [string] [length] [4000]
+                        EmitInt32(il, DbString.DefaultLength); // [string] [length] [4000]
                         il.Emit(OpCodes.Cgt); // [string] [0 or 1]
                         Label isLong = il.DefineLabel(), lenDone = il.DefineLabel();
                         il.Emit(OpCodes.Brtrue_S, isLong);
-                        EmitInt32(il, 4000); // [string] [4000]
+                        EmitInt32(il, DbString.DefaultLength); // [string] [4000]
                         il.Emit(OpCodes.Br_S, lenDone);
                         il.MarkLabel(isLong);
                         EmitInt32(il, -1); // [string] [-1]
@@ -2798,7 +3276,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                     {
                         il.Emit(OpCodes.Ldstr, literal.Token);
                         il.Emit(OpCodes.Ldloc_0); // command, sql, typed parameter
-                        il.EmitCall(OpCodes.Callvirt, prop.GetGetMethod(), null); // command, sql, typed value
+                        il.EmitCall(callOpCode, prop.GetGetMethod(), null); // command, sql, typed value
                         Type propType = prop.PropertyType;
                         var typeCode = Type.GetTypeCode(propType);
                         switch (typeCode)
@@ -2876,7 +3354,9 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
             {
                 cmd = command.SetupCommand(cnn, paramReader);
                 if (wasClosed) cnn.Open();
-                return cmd.ExecuteNonQuery();
+                int result = cmd.ExecuteNonQuery();
+                command.OnCompleted();
+                return result;
             }
             finally
             {
@@ -2885,34 +3365,64 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
             }
         }
 
-        private static IDataReader ExecuteReaderImpl(IDbConnection cnn, ref CommandDefinition command)
+        private static T ExecuteScalarImpl<T>(IDbConnection cnn, ref CommandDefinition command)
         {
-            Action<IDbCommand, object> paramReader = GetParameterReader(cnn, ref command);
+            Action<IDbCommand, object> paramReader = null;
+            object param = command.Parameters;
+            if (param != null)
+            {
+                var identity = new Identity(command.CommandText, command.CommandType, cnn, null, param.GetType(), null);
+                paramReader = GetCacheInfo(identity, command.Parameters, command.AddToCache).ParamReader;
+            }
 
             IDbCommand cmd = null;
             bool wasClosed = cnn.State == ConnectionState.Closed;
+            object result;
             try
             {
                 cmd = command.SetupCommand(cnn, paramReader);
                 if (wasClosed) cnn.Open();
-                var reader = cmd.ExecuteReader(wasClosed ? CommandBehavior.CloseConnection : CommandBehavior.Default);
-                wasClosed = false;
-                return reader;
+                result =cmd.ExecuteScalar();
+                command.OnCompleted();
             }
             finally
             {
                 if (wasClosed) cnn.Close();
                 if (cmd != null) cmd.Dispose();
+            }
+            return Parse<T>(result);
+        }
+
+        private static IDataReader ExecuteReaderImpl(IDbConnection cnn, ref CommandDefinition command, CommandBehavior commandBehavior, out IDbCommand cmd)
+        {
+            Action<IDbCommand, object> paramReader = GetParameterReader(cnn, ref command);
+            cmd = null;
+            bool wasClosed = cnn.State == ConnectionState.Closed, disposeCommand = true;
+            try
+            {
+                cmd = command.SetupCommand(cnn, paramReader);
+                if (wasClosed) cnn.Open();
+                if (wasClosed) commandBehavior |= CommandBehavior.CloseConnection;
+                var reader = cmd.ExecuteReader(commandBehavior);
+                wasClosed = false; // don't dispose before giving it to them!
+                disposeCommand = false;
+                // note: command.FireOutputCallbacks(); would be useless here; parameters come at the **end** of the TDS stream
+                return reader;
+            }
+            finally
+            {
+                if (wasClosed) cnn.Close();
+                if (cmd != null && disposeCommand) cmd.Dispose();
             }
         }
 
         private static Action<IDbCommand, object> GetParameterReader(IDbConnection cnn, ref CommandDefinition command)
         {
             object param = command.Parameters;
-            IEnumerable multiExec = (object)param as IEnumerable;
+            IEnumerable multiExec = GetMultiExec(param);
             Identity identity;
             CacheInfo info = null;
-            if (multiExec != null && !(multiExec is string))
+            if (multiExec != null)
             {
                 throw new NotSupportedException("MultiExec is not supported by ExecuteReader");
             }
@@ -2921,7 +3431,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
             if (param != null)
             {
                 identity = new Identity(command.CommandText, command.CommandType, cnn, null, param.GetType(), null);
-                info = GetCacheInfo(identity, param);
+                info = GetCacheInfo(identity, param, command.AddToCache);
             }
             var paramReader = info == null ? null : info.ParamReader;
             return paramReader;
@@ -2950,6 +3460,10 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                 return r =>
                 {
                     var val = r.GetValue(index);
+                    if(val is float || val is double || val is decimal)
+                    {
+                        val = Convert.ChangeType(val, Enum.GetUnderlyingType(effectiveType), CultureInfo.InvariantCulture);
+                    }
                     return val is DBNull ? null : Enum.ToObject(effectiveType, val);
                 };
             }
@@ -2967,6 +3481,28 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                 var val = r.GetValue(index);
                 return val is DBNull ? null : val;
             };
+        }
+
+        private static T Parse<T>(object value)
+        {
+            if (value == null || value is DBNull) return default(T);
+            if (value is T) return (T)value;
+            var type = typeof(T);
+            type = Nullable.GetUnderlyingType(type) ?? type;
+            if (type.IsEnum)
+            {
+                if (value is float || value is double || value is decimal)
+                {
+                    value = Convert.ChangeType(value, Enum.GetUnderlyingType(type), CultureInfo.InvariantCulture);
+                }
+                return (T)Enum.ToObject(type, value);
+            }
+            ITypeHandler handler;
+            if (typeHandlers.TryGetValue(type, out handler))
+            {
+                return (T)handler.Parse(type, value);
+            }
+            return (T)Convert.ChangeType(value, type, CultureInfo.InvariantCulture);
         }
 
         static readonly MethodInfo
@@ -3062,7 +3598,7 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
 
             if (reader.FieldCount <= startBound)
             {
-                throw new ArgumentException(MultiMapSplitExceptionMessage, "splitOn");
+                throw MultiMapException(reader);
             }
 
             var names = Enumerable.Range(startBound, length).Select(i => reader.GetName(i)).ToArray();
@@ -3087,26 +3623,67 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
                     types[i - startBound] = reader.GetFieldType(i);
                 }
 
-                var ctor = typeMap.FindConstructor(names, types);
-                if (ctor == null)
+                var explicitConstr = typeMap.FindExplicitConstructor();
+                if (explicitConstr != null)
                 {
-                    string proposedTypes = "(" + string.Join(", ", types.Select((t, i) => t.FullName + " " + names[i]).ToArray()) + ")";
-                    throw new InvalidOperationException(string.Format("A parameterless default constructor or one matching signature {0} is required for {1} materialization", proposedTypes, type.FullName));
-                }
+                    var structLocals = new Dictionary<Type, LocalBuilder>();
 
-                if (ctor.GetParameters().Length == 0)
-                {
-                    il.Emit(OpCodes.Newobj, ctor);
+                    var consPs = explicitConstr.GetParameters();
+                    foreach(var p in consPs)
+                    {
+                        if(!p.ParameterType.IsValueType)
+                        {
+                            il.Emit(OpCodes.Ldnull);
+                        }
+                        else
+                        {
+                            LocalBuilder loc;
+                            if(!structLocals.TryGetValue(p.ParameterType, out loc))
+                            {
+                                structLocals[p.ParameterType] = loc = il.DeclareLocal(p.ParameterType);
+                            }
+
+                            il.Emit(OpCodes.Ldloca, (short)loc.LocalIndex);
+                            il.Emit(OpCodes.Initobj, p.ParameterType);
+                            il.Emit(OpCodes.Ldloca, (short)loc.LocalIndex);
+                            il.Emit(OpCodes.Ldobj, p.ParameterType);
+                        }
+                    }
+
+                    il.Emit(OpCodes.Newobj, explicitConstr);
                     il.Emit(OpCodes.Stloc_1);
                     supportInitialize = typeof(ISupportInitialize).IsAssignableFrom(type);
-                    if(supportInitialize)
+                    if (supportInitialize)
                     {
                         il.Emit(OpCodes.Ldloc_1);
                         il.EmitCall(OpCodes.Callvirt, typeof(ISupportInitialize).GetMethod("BeginInit"), null);
                     }
                 }
                 else
-                    specializedConstructor = ctor;
+                {
+                    var ctor = typeMap.FindConstructor(names, types);
+                    if (ctor == null)
+                    {
+                        string proposedTypes = "(" + string.Join(", ", types.Select((t, i) => t.FullName + " " + names[i]).ToArray()) + ")";
+                        throw new InvalidOperationException(string.Format("A parameterless default constructor or one matching signature {0} is required for {1} materialization", proposedTypes, type.FullName));
+                    }
+
+                    if (ctor.GetParameters().Length == 0)
+                    {
+                        il.Emit(OpCodes.Newobj, ctor);
+                        il.Emit(OpCodes.Stloc_1);
+                        supportInitialize = typeof(ISupportInitialize).IsAssignableFrom(type);
+                        if (supportInitialize)
+                        {
+                            il.Emit(OpCodes.Ldloc_1);
+                            il.EmitCall(OpCodes.Callvirt, typeof(ISupportInitialize).GetMethod("BeginInit"), null);
+                        }
+                    }
+                    else
+                    {
+                        specializedConstructor = ctor;
+                    }
+                }
             }
 
             il.BeginExceptionBlock();
@@ -3127,7 +3704,7 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
 
             bool first = true;
             var allDone = il.DefineLabel();
-            int enumDeclareLocal = -1;
+            int enumDeclareLocal = -1, valueCopyLocal = il.DeclareLocal(typeof(object)).LocalIndex;
             foreach (var item in members)
             {
                 if (item != null)
@@ -3142,7 +3719,9 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
                     il.Emit(OpCodes.Dup);// stack is now [target][target][reader][index][index]
                     il.Emit(OpCodes.Stloc_0);// stack is now [target][target][reader][index]
                     il.Emit(OpCodes.Callvirt, getItem); // stack is now [target][target][value-as-object]
-
+                    il.Emit(OpCodes.Dup); // stack is now [target][target][value-as-object][value-as-object]
+                    StoreLocal(il, valueCopyLocal);
+                    Type colType = reader.GetFieldType(index);
                     Type memberType = item.MemberType;
 
                     if (memberType == typeof(char) || memberType == typeof(char?))
@@ -3163,33 +3742,30 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
 
                         if (unboxType.IsEnum)
                         {
-                            if (enumDeclareLocal == -1)
+                            Type numericType = Enum.GetUnderlyingType(unboxType);
+                            if(colType == typeof(string))
                             {
-                                enumDeclareLocal = il.DeclareLocal(typeof(string)).LocalIndex;
+                                if (enumDeclareLocal == -1)
+                                {
+                                    enumDeclareLocal = il.DeclareLocal(typeof(string)).LocalIndex;
+                                }
+                                il.Emit(OpCodes.Castclass, typeof(string)); // stack is now [target][target][string]
+                                StoreLocal(il, enumDeclareLocal); // stack is now [target][target]
+                                il.Emit(OpCodes.Ldtoken, unboxType); // stack is now [target][target][enum-type-token]
+                                il.EmitCall(OpCodes.Call, typeof(Type).GetMethod("GetTypeFromHandle"), null);// stack is now [target][target][enum-type]
+                                LoadLocal(il, enumDeclareLocal); // stack is now [target][target][enum-type][string]
+                                il.Emit(OpCodes.Ldc_I4_1); // stack is now [target][target][enum-type][string][true]
+                                il.EmitCall(OpCodes.Call, enumParse, null); // stack is now [target][target][enum-as-object]
+                                il.Emit(OpCodes.Unbox_Any, unboxType); // stack is now [target][target][typed-value]
                             }
-
-                            Label isNotString = il.DefineLabel();
-                            il.Emit(OpCodes.Dup); // stack is now [target][target][value][value]
-                            il.Emit(OpCodes.Isinst, typeof(string)); // stack is now [target][target][value-as-object][string or null]
-                            il.Emit(OpCodes.Dup);// stack is now [target][target][value-as-object][string or null][string or null]
-                            StoreLocal(il, enumDeclareLocal); // stack is now [target][target][value-as-object][string or null]
-                            il.Emit(OpCodes.Brfalse_S, isNotString); // stack is now [target][target][value-as-object]
-
-                            il.Emit(OpCodes.Pop); // stack is now [target][target]
-
-                            il.Emit(OpCodes.Ldtoken, unboxType); // stack is now [target][target][enum-type-token]
-                            il.EmitCall(OpCodes.Call, typeof(Type).GetMethod("GetTypeFromHandle"), null);// stack is now [target][target][enum-type]
-                            il.Emit(OpCodes.Ldloc_2); // stack is now [target][target][enum-type][string]
-                            il.Emit(OpCodes.Ldc_I4_1); // stack is now [target][target][enum-type][string][true]
-                            il.EmitCall(OpCodes.Call, enumParse, null); // stack is now [target][target][enum-as-object]
-
-                            il.MarkLabel(isNotString);
-
-                            il.Emit(OpCodes.Unbox_Any, unboxType); // stack is now [target][target][typed-value]
+                            else
+                            {
+                                FlexibleConvertBoxedFromHeadOfStack(il, colType, unboxType, numericType);
+                            }
 
                             if (nullUnderlyingType != null)
                             {
-                                il.Emit(OpCodes.Newobj, memberType.GetConstructor(new[] { nullUnderlyingType })); // stack is now [target][target][enum-value]
+                                il.Emit(OpCodes.Newobj, memberType.GetConstructor(new[] { nullUnderlyingType })); // stack is now [target][target][typed-value]
                             }
                         }
                         else if (memberType.FullName == LinqBinary)
@@ -3199,10 +3775,9 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
                         }
                         else
                         {
-                            Type dataType = reader.GetFieldType(index);
-                            TypeCode dataTypeCode = Type.GetTypeCode(dataType), unboxTypeCode = Type.GetTypeCode(unboxType);
+                            TypeCode dataTypeCode = Type.GetTypeCode(colType), unboxTypeCode = Type.GetTypeCode(unboxType);
                             bool hasTypeHandler;
-                            if ((hasTypeHandler = typeHandlers.ContainsKey(unboxType)) || dataType == unboxType || dataTypeCode == unboxTypeCode || dataTypeCode == Type.GetTypeCode(nullUnderlyingType))
+                            if ((hasTypeHandler = typeHandlers.ContainsKey(unboxType)) || colType == unboxType || dataTypeCode == unboxTypeCode || dataTypeCode == Type.GetTypeCode(nullUnderlyingType))
                             {
                                 if (hasTypeHandler)
                                 {
@@ -3218,71 +3793,7 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
                             else
                             {
                                 // not a direct match; need to tweak the unbox
-                                MethodInfo op;
-                                if ((op = GetOperator(dataType, nullUnderlyingType ?? unboxType)) != null)
-                                { // this is handy for things like decimal <===> double
-                                    il.Emit(OpCodes.Unbox_Any, dataType); // stack is now [target][target][data-typed-value]
-                                    il.Emit(OpCodes.Call, op); // stack is now [target][target][typed-value]
-                                }
-                                else
-                                {
-                                    bool handled = true;
-                                    OpCode opCode = default(OpCode);
-                                    if (dataTypeCode == TypeCode.Decimal || unboxTypeCode == TypeCode.Decimal)
-                                    {   // no IL level conversions to/from decimal; I guess we could use the static operators, but
-                                        // this feels an edge-case
-                                        handled = false;
-                                    }
-                                    else
-                                    {
-                                        switch (unboxTypeCode)
-                                        {
-                                            case TypeCode.Byte:
-                                                opCode = OpCodes.Conv_Ovf_I1_Un; break;
-                                            case TypeCode.SByte:
-                                                opCode = OpCodes.Conv_Ovf_I1; break;
-                                            case TypeCode.UInt16:
-                                                opCode = OpCodes.Conv_Ovf_I2_Un; break;
-                                            case TypeCode.Int16:
-                                                opCode = OpCodes.Conv_Ovf_I2; break;
-                                            case TypeCode.UInt32:
-                                                opCode = OpCodes.Conv_Ovf_I4_Un; break;
-                                            case TypeCode.Boolean: // boolean is basically an int, at least at this level
-                                            case TypeCode.Int32:
-                                                opCode = OpCodes.Conv_Ovf_I4; break;
-                                            case TypeCode.UInt64:
-                                                opCode = OpCodes.Conv_Ovf_I8_Un; break;
-                                            case TypeCode.Int64:
-                                                opCode = OpCodes.Conv_Ovf_I8; break;
-                                            case TypeCode.Single:
-                                                opCode = OpCodes.Conv_R4; break;
-                                            case TypeCode.Double:
-                                                opCode = OpCodes.Conv_R8; break;
-                                            default:
-                                                handled = false;
-                                                break;
-                                        }
-                                    }
-                                    if (handled)
-                                    { // unbox as the data-type, then use IL-level convert
-                                        il.Emit(OpCodes.Unbox_Any, dataType); // stack is now [target][target][data-typed-value]
-                                        il.Emit(opCode); // stack is now [target][target][typed-value]
-                                        if (unboxTypeCode == TypeCode.Boolean)
-                                        { // compare to zero; I checked "csc" - this is the trick it uses; nice
-                                            il.Emit(OpCodes.Ldc_I4_0);
-                                            il.Emit(OpCodes.Ceq);
-                                            il.Emit(OpCodes.Ldc_I4_0);
-                                            il.Emit(OpCodes.Ceq);
-                                        }
-                                    }
-                                    else
-                                    { // use flexible conversion
-                                        il.Emit(OpCodes.Ldtoken, nullUnderlyingType ?? unboxType); // stack is now [target][target][value][member-type-token]
-                                        il.EmitCall(OpCodes.Call, typeof(Type).GetMethod("GetTypeFromHandle"), null); // stack is now [target][target][value][member-type]
-                                        il.EmitCall(OpCodes.Call, typeof(Convert).GetMethod("ChangeType", new Type[] { typeof(object), typeof(Type) }), null); // stack is now [target][target][boxed-member-type-value]
-                                        il.Emit(OpCodes.Unbox_Any, nullUnderlyingType ?? unboxType); // stack is now [target][target][typed-value]
-                                    }
-                                }
+                                FlexibleConvertBoxedFromHeadOfStack(il, colType, nullUnderlyingType ?? unboxType, null);
                                 if (nullUnderlyingType != null)
                                 {
                                     il.Emit(OpCodes.Newobj, unboxType.GetConstructor(new[] { nullUnderlyingType })); // stack is now [target][target][typed-value]
@@ -3370,6 +3881,7 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
             il.BeginCatchBlock(typeof(Exception)); // stack is Exception
             il.Emit(OpCodes.Ldloc_0); // stack is Exception, index
             il.Emit(OpCodes.Ldarg_0); // stack is Exception, index, reader
+            LoadLocal(il, valueCopyLocal); // stack is Exception, index, reader, value
             il.EmitCall(OpCodes.Call, typeof(SqlMapper).GetMethod("ThrowDataException"), null);
             il.EndExceptionBlock();
 
@@ -3382,6 +3894,89 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
 
             return (Func<IDataReader, object>)dm.CreateDelegate(typeof(Func<IDataReader, object>));
         }
+
+        private static void FlexibleConvertBoxedFromHeadOfStack(ILGenerator il, Type from, Type to, Type via)
+        {
+            MethodInfo op;
+            if(from == (via ?? to))
+            {
+                il.Emit(OpCodes.Unbox_Any, to); // stack is now [target][target][typed-value]
+            }
+            else if ((op = GetOperator(from,to)) != null)
+            {
+                // this is handy for things like decimal <===> double
+                il.Emit(OpCodes.Unbox_Any, from); // stack is now [target][target][data-typed-value]
+                il.Emit(OpCodes.Call, op); // stack is now [target][target][typed-value]
+            }
+            else
+            {
+                bool handled = false;
+                OpCode opCode = default(OpCode);
+                switch (Type.GetTypeCode(from))
+                {
+                    case TypeCode.Boolean:
+                    case TypeCode.Byte:
+                    case TypeCode.SByte:
+                    case TypeCode.Int16:
+                    case TypeCode.UInt16:
+                    case TypeCode.Int32:
+                    case TypeCode.UInt32:
+                    case TypeCode.Int64:
+                    case TypeCode.UInt64:
+                    case TypeCode.Single:
+                    case TypeCode.Double:
+                        handled = true;
+                        switch (Type.GetTypeCode(via ?? to))
+                        {
+                            case TypeCode.Byte:
+                                opCode = OpCodes.Conv_Ovf_I1_Un; break;
+                            case TypeCode.SByte:
+                                opCode = OpCodes.Conv_Ovf_I1; break;
+                            case TypeCode.UInt16:
+                                opCode = OpCodes.Conv_Ovf_I2_Un; break;
+                            case TypeCode.Int16:
+                                opCode = OpCodes.Conv_Ovf_I2; break;
+                            case TypeCode.UInt32:
+                                opCode = OpCodes.Conv_Ovf_I4_Un; break;
+                            case TypeCode.Boolean: // boolean is basically an int, at least at this level
+                            case TypeCode.Int32:
+                                opCode = OpCodes.Conv_Ovf_I4; break;
+                            case TypeCode.UInt64:
+                                opCode = OpCodes.Conv_Ovf_I8_Un; break;
+                            case TypeCode.Int64:
+                                opCode = OpCodes.Conv_Ovf_I8; break;
+                            case TypeCode.Single:
+                                opCode = OpCodes.Conv_R4; break;
+                            case TypeCode.Double:
+                                opCode = OpCodes.Conv_R8; break;
+                            default:
+                                handled = false;
+                                break;
+                        }
+                        break;
+                }
+                if (handled)
+                {
+                    il.Emit(OpCodes.Unbox_Any, from); // stack is now [target][target][col-typed-value]
+                    il.Emit(opCode); // stack is now [target][target][typed-value]
+                    if (to == typeof(bool))
+                    { // compare to zero; I checked "csc" - this is the trick it uses; nice
+                        il.Emit(OpCodes.Ldc_I4_0);
+                        il.Emit(OpCodes.Ceq);
+                        il.Emit(OpCodes.Ldc_I4_0);
+                        il.Emit(OpCodes.Ceq);
+                    }
+                }
+                else
+                {
+                    il.Emit(OpCodes.Ldtoken, via ?? to); // stack is now [target][target][value][member-type-token]
+                    il.EmitCall(OpCodes.Call, typeof(Type).GetMethod("GetTypeFromHandle"), null); // stack is now [target][target][value][member-type]
+                    il.EmitCall(OpCodes.Call, typeof(Convert).GetMethod("ChangeType", new Type[] { typeof(object), typeof(Type) }), null); // stack is now [target][target][boxed-member-type-value]
+                    il.Emit(OpCodes.Unbox_Any, to); // stack is now [target][target][typed-value]
+                }
+            }            
+        }
+
         static MethodInfo GetOperator(Type from, Type to)
         {
             if (to == null) return null;
@@ -3462,36 +4057,33 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
         /// <summary>
         /// Throws a data exception, only used internally
         /// </summary>
-        /// <param name="ex"></param>
-        /// <param name="index"></param>
-        /// <param name="reader"></param>
-        public static void ThrowDataException(Exception ex, int index, IDataReader reader)
+        [Obsolete("Intended for internal use only")]
+        public static void ThrowDataException(Exception ex, int index, IDataReader reader, object value)
         {
             Exception toThrow;
             try
             {
-                string name = "(n/a)", value = "(n/a)";
+                string name = "(n/a)", formattedValue = "(n/a)";
                 if (reader != null && index >= 0 && index < reader.FieldCount)
                 {
                     name = reader.GetName(index);
                     try
                     {
-                        object val = reader.GetValue(index); // if there throw an exception, then I got one message, but Which column?
-                        if (val == null || val is DBNull)
+                        if (value == null || value is DBNull)
                         {
-                            value = "<null>";
+                            formattedValue = "<null>";
                         }
                         else
                         {
-                            value = Convert.ToString(val) + " - " + Type.GetTypeCode(val.GetType());
+                            formattedValue = Convert.ToString(value) + " - " + Type.GetTypeCode(value.GetType());
                         }
                     }
                     catch (Exception valEx)
                     {
-                        value = valEx.Message;
+                        formattedValue = valEx.Message;
                     }
                 }
-                toThrow = new DataException(string.Format("Error parsing column {0} ({1}={2})", index, name, value), ex);
+                toThrow = new DataException(string.Format("Error parsing column {0} ({1}={2})", index, name, formattedValue), ex);
             }
             catch
             { // throw the **original** exception, wrapped as DataException
@@ -3555,11 +4147,12 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
             private IDbCommand command;
             private Identity identity;
 
-            internal GridReader(IDbCommand command, IDataReader reader, Identity identity)
+            internal GridReader(IDbCommand command, IDataReader reader, Identity identity, SqlMapper.IParameterCallbacks callbacks)
             {
                 this.command = command;
                 this.reader = reader;
                 this.identity = identity;
+                this.callbacks = callbacks;
             }
 
 #if !CSHARP30
@@ -3567,9 +4160,10 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
             /// <summary>
             /// Read the next grid of results, returned as a dynamic object
             /// </summary>
+            /// <remarks>Note: each row can be accessed via "dynamic", or by casting to an IDictionary&lt;string,object&gt;</remarks>
             public IEnumerable<dynamic> Read(bool buffered = true)
             {
-                return Read<DapperRow>(buffered);
+                return ReadImpl<dynamic>(typeof(DapperRow), buffered);
             }
 #endif
 
@@ -3591,21 +4185,7 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
             public IEnumerable<T> Read<T>(bool buffered = true)
 #endif
             {
-                if (reader == null) throw new ObjectDisposedException(GetType().FullName, "The reader has been disposed; this can happen after all data has been consumed");
-                if (consumed) throw new InvalidOperationException("Query results must be consumed in the correct order, and each result can only be consumed once");
-                var typedIdentity = identity.ForGrid(typeof(T), gridIndex);
-                CacheInfo cache = GetCacheInfo(typedIdentity, null);
-                var deserializer = cache.Deserializer;
-
-                int hash = GetColumnHash(reader);
-                if (deserializer.Func == null || deserializer.Hash != hash)
-                {
-                    deserializer = new DeserializerState(hash, GetDeserializer(typeof(T), reader, 0, -1, false));
-                    cache.Deserializer = deserializer;
-                }
-                consumed = true;
-                var result = ReadDeferred<T>(gridIndex, deserializer.Func, typedIdentity);
-                return buffered ? result.ToList() : result;
+                return ReadImpl<T>(typeof(T), buffered);
             }
 
             /// <summary>
@@ -3618,10 +4198,15 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
 #endif
             {
                 if (type == null) throw new ArgumentNullException("type");
+                return ReadImpl<object>(type, buffered);
+            }
+
+            private IEnumerable<T> ReadImpl<T>(Type type, bool buffered)
+            {
                 if (reader == null) throw new ObjectDisposedException(GetType().FullName, "The reader has been disposed; this can happen after all data has been consumed");
                 if (consumed) throw new InvalidOperationException("Query results must be consumed in the correct order, and each result can only be consumed once");
                 var typedIdentity = identity.ForGrid(type, gridIndex);
-                CacheInfo cache = GetCacheInfo(typedIdentity, null);
+                CacheInfo cache = GetCacheInfo(typedIdentity, null, true);
                 var deserializer = cache.Deserializer;
 
                 int hash = GetColumnHash(reader);
@@ -3631,9 +4216,10 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
                     cache.Deserializer = deserializer;
                 }
                 consumed = true;
-                var result = ReadDeferred<object>(gridIndex, deserializer.Func, typedIdentity);
+                var result = ReadDeferred<T>(gridIndex, deserializer.Func, typedIdentity);
                 return buffered ? result.ToList() : result;
             }
+
 
             private IEnumerable<TReturn> MultiReadInternal<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(Delegate func, string splitOn)
             {
@@ -3648,7 +4234,7 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
                 }, gridIndex);
                 try
                 {
-                    foreach (var r in SqlMapper.MultiMapImpl<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(null, default(CommandDefinition), func, splitOn, reader, identity))
+                    foreach (var r in SqlMapper.MultiMapImpl<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(null, default(CommandDefinition), func, splitOn, reader, identity, false))
                     {
                         yield return r;
                     }
@@ -3774,6 +4360,18 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
             }
             private int gridIndex, readCount;
             private bool consumed;
+            private SqlMapper.IParameterCallbacks callbacks;
+
+            /// <summary>
+            /// Has the underlying reader been consumed?
+            /// </summary>
+            public bool IsConsumed
+            {
+                get
+                {
+                    return consumed;
+                }
+            }
             private void NextResult()
             {
                 if (reader.NextResult())
@@ -3788,10 +4386,9 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
                     // need for "Cancel" etc
                     reader.Dispose();
                     reader = null;
-
+                    if (callbacks != null) callbacks.OnCompleted();
                     Dispose();
                 }
-
             }
             /// <summary>
             /// Dispose the grid, closing and disposing both the underlying reader and command.
@@ -3845,12 +4442,39 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
         {
             return table == null ? null : table.ExtendedProperties[DataTableTypeNameKey] as string;
         }
+
+
+        // one per thread
+        [ThreadStatic]
+        private static StringBuilder perThreadStringBuilderCache;
+        private static StringBuilder GetStringBuilder()
+        {
+            var tmp = perThreadStringBuilderCache;
+            if (tmp != null)
+            {
+                perThreadStringBuilderCache = null;
+                tmp.Length = 0;
+                return tmp;
+            }
+            return new StringBuilder();
+        }
+
+        private static string __ToStringRecycle(this StringBuilder obj)
+        {
+            if (obj == null) return "";
+            var s = obj.ToString();
+            if(perThreadStringBuilderCache == null)
+            {
+                perThreadStringBuilderCache = obj;
+            }
+            return s;
+        }
     }
 
     /// <summary>
     /// A bag of parameters that can be passed to the Dapper Query and Execute methods
     /// </summary>
-    partial class DynamicParameters : SqlMapper.IDynamicParameters, SqlMapper.IParameterLookup
+    partial class DynamicParameters : SqlMapper.IDynamicParameters, SqlMapper.IParameterLookup, SqlMapper.IParameterCallbacks
     {
         internal const DbType EnumerableMultiParameter = (DbType)(-1);
         static Dictionary<SqlMapper.Identity, Action<IDbCommand, object>> paramReaderCache = new Dictionary<SqlMapper.Identity, Action<IDbCommand, object>>();
@@ -3876,6 +4500,9 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
             public DbType? DbType { get; set; }
             public int? Size { get; set; }
             public IDbDataParameter AttachedParam { get; set; }
+            internal Action<object, DynamicParameters> OutputCallback { get; set; }
+            internal object OutputTarget { get; set; }
+            internal bool CameFromTemplate { get; set; }
 
             internal static ParamInfo ToParamInfo(IDataParameter param)
             {
@@ -3910,7 +4537,7 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
                 DbType? dbType = pi.DbType;
                 if (dbType == null && pi.Value != null)
                 { 
-                    dbType = SqlMapper.LookupDbType(pi.Value.GetType(), Clean(pi.Name), out handler);
+                    dbType = SqlMapper.LookupDbType(pi.Value.GetType(), Clean(pi.Name), true, out handler);
                 }
                 IDbDataParameter dbParam = param as IDbDataParameter;
                 param.ParameterName = pi.Name;
@@ -3950,13 +4577,7 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
         /// EG: AddDynamicParams(new {A = 1, B = 2}) // will add property A and B to the dynamic
         /// </summary>
         /// <param name="param"></param>
-        public void AddDynamicParams(
-#if CSHARP30
-object param
-#else
-dynamic param
-#endif
-)
+        public void AddDynamicParams(object param)
         {
             var obj = param as object;
             if (obj != null)
@@ -3974,11 +4595,7 @@ dynamic param
                     {
                         foreach (var kvp in dictionary)
                         {
-#if CSHARP30
                             Add(kvp.Key, kvp.Value, null, null, null);
-#else
-                            Add(kvp.Key, kvp.Value);
-#endif
                         }
                     }
                 }
@@ -4061,6 +4678,7 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
         protected void AddParameters(IDbCommand command, SqlMapper.Identity identity)
         {
             var literals = SqlMapper.GetLiteralTokens(identity.sql);
+
             if (templates != null)
             {
                 foreach (var template in templates)
@@ -4079,17 +4697,51 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
 
                     appender(command, template);
                 }
+
+                // The parameters were added to the command, but not the 
+                // DynamicParameters until now.
+                foreach (IDbDataParameter param in command.Parameters)
+                {
+                    // If someone makes a DynamicParameters with a template,
+                    // then explicitly adds a parameter of a matching name,
+                    // it will already exist in 'parameters'.
+                    if (!parameters.ContainsKey(param.ParameterName)) 
+                    { 
+                        parameters.Add(param.ParameterName, new ParamInfo
+                        {
+                            AttachedParam = param,
+                            CameFromTemplate = true,
+                            DbType = param.DbType,
+                            Name = param.ParameterName,
+                            ParameterDirection = param.Direction,
+                            Size = param.Size,
+                            Value = param.Value
+                        });
+                    }
+                }
+
+                // Now that the parameters are added to the command, let's place our output callbacks
+                var tmp = outputCallbacks;
+                if (tmp != null)
+                {
+                    foreach (var generator in tmp)
+                    {
+                        generator();
+                    }
+                }
             }
 
             foreach (var param in parameters.Values)
             {
+                if (param.CameFromTemplate) continue;
+
                 var dbType = param.DbType;
                 var val = param.Value;
                 string name = Clean(param.Name);
                 var isCustomQueryParameter = val is SqlMapper.ICustomQueryParameter;
 
                 SqlMapper.ITypeHandler handler = null;
-                if (dbType == null && val != null && !isCustomQueryParameter) dbType = SqlMapper.LookupDbType(val.GetType(), name, out handler);
+                if (dbType == null && val != null && !isCustomQueryParameter) dbType = SqlMapper.LookupDbType(val.GetType(), name, true, out handler);
                 if (dbType == DynamicParameters.EnumerableMultiParameter)
                 {
 #pragma warning disable 612, 618
@@ -4126,9 +4778,9 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
                         var s = val as string;
                         if (s != null)
                         {
-                            if (s.Length <= 4000)
+                            if (s.Length <= DbString.DefaultLength)
                             {
-                                p.Size = 4000;
+                                p.Size = DbString.DefaultLength;
                             }
                         }
                         if (param.Size != null)
@@ -4221,7 +4873,10 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
                 // re-attach parameters
                 foreach (string paramName in parameters.Keys)
                 {
-                    parameters[paramName].AttachedParam = command.Parameters[paramName] as IDbDataParameter;
+                    if (command.Parameters.Contains(paramName))
+                    {
+                        parameters[paramName].AttachedParam = command.Parameters[paramName] as IDbDataParameter;
+                    }
                 }
             }
 
@@ -4259,6 +4914,187 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
                 return default(T);
             }
             return (T)val;
+        }
+
+        /// <summary>
+        /// Allows you to automatically populate a target property/field from output parameters. It actually
+        /// creates an InputOutput parameter, so you can still pass data in. 
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <param name="target">The object whose property/field you wish to populate.</param>
+        /// <param name="expression">A MemberExpression targeting a property/field of the target (or descendant thereof.)</param>
+        /// <param name="dbType"></param>
+        /// <param name="size">The size to set on the parameter. Defaults to 0, or DbString.DefaultLength in case of strings.</param>
+        /// <returns>The DynamicParameters instance</returns>
+#if CSHARP30
+        public DynamicParameters Output<T>(T target, Expression<Func<T, object>> expression, DbType? dbType, int? size)
+#else
+        public DynamicParameters Output<T>(T target, Expression<Func<T, object>> expression, DbType? dbType = null, int? size = null)
+#endif
+        {
+            var failMessage = "Expression must be a property/field chain off of a(n) {0} instance";
+            failMessage = string.Format(failMessage, typeof(T).Name);
+            Action @throw = () => { throw new InvalidOperationException(failMessage); };
+
+            // Is it even a MemberExpression?
+            var lastMemberAccess = expression.Body as MemberExpression;
+
+            if (lastMemberAccess == null ||
+                (lastMemberAccess.Member.MemberType != MemberTypes.Property &&
+                lastMemberAccess.Member.MemberType != MemberTypes.Field))
+            {
+                if (expression.Body.NodeType == ExpressionType.Convert &&
+                    expression.Body.Type == typeof(object) &&
+                    ((UnaryExpression)expression.Body).Operand is MemberExpression)
+                {
+                    // It's got to be unboxed
+                    lastMemberAccess = (MemberExpression)((UnaryExpression)expression.Body).Operand;
+                }
+                else @throw();
+            }
+
+            // Does the chain consist of MemberExpressions leading to a ParameterExpression of type T?
+            MemberExpression diving = lastMemberAccess;
+            ParameterExpression constant = null;
+            // Retain a list of member names and the member expressions so we can rebuild the chain.
+            List<string> names = new List<string>();
+            List<MemberExpression> chain = new List<MemberExpression>();
+
+            do
+            {
+                // Insert the names in the right order so expression 
+                // "Post.Author.Name" becomes parameter "PostAuthorName"
+                names.Insert(0, diving.Member.Name);
+                chain.Insert(0, diving);
+
+                constant = diving.Expression as ParameterExpression;
+                diving = diving.Expression as MemberExpression;
+
+                if (constant != null &&
+                    constant.Type == typeof(T))
+                {
+                    break;
+                }
+                else if (diving == null ||
+                    (diving.Member.MemberType != MemberTypes.Property &&
+                    diving.Member.MemberType != MemberTypes.Field))
+                {
+                    @throw();
+                }
+            }
+            while (diving != null);
+
+            var dynamicParamName = string.Join(string.Empty, names.ToArray());
+
+            // Before we get all emitty...
+            var lookup = string.Join("|", names.ToArray());
+
+            var cache = CachedOutputSetters<T>.Cache;
+            var setter = (Action<object, DynamicParameters>)cache[lookup];
+
+            if (setter != null) goto MAKECALLBACK;
+
+            // Come on let's build a method, let's build it, let's build it now!
+            var dm = new DynamicMethod(string.Format("ExpressionParam{0}", Guid.NewGuid()), null, new[] { typeof(object), this.GetType() }, true);
+            var il = dm.GetILGenerator();
+
+            il.Emit(OpCodes.Ldarg_0); // [object]
+            il.Emit(OpCodes.Castclass, typeof(T));    // [T]
+
+            // Count - 1 to skip the last member access
+            var i = 0;
+            for (; i < (chain.Count - 1); i++)
+            {
+                var member = chain[0].Member;
+
+                if (member.MemberType == MemberTypes.Property)
+                {
+                    var get = ((PropertyInfo)member).GetGetMethod(true);
+                    il.Emit(OpCodes.Callvirt, get); // [Member{i}]
+                }
+                else // Else it must be a field!
+                {
+                    il.Emit(OpCodes.Ldfld, ((FieldInfo)member)); // [Member{i}]
+                }
+            }
+
+            var paramGetter = this.GetType().GetMethod("Get", new Type[] { typeof(string) }).MakeGenericMethod(lastMemberAccess.Type);
+
+            il.Emit(OpCodes.Ldarg_1); // [target] [DynamicParameters]
+            il.Emit(OpCodes.Ldstr, dynamicParamName); // [target] [DynamicParameters] [ParamName]
+            il.Emit(OpCodes.Callvirt, paramGetter); // [target] [value], it's already typed thanks to generic method
+            
+            // GET READY
+            var lastMember = lastMemberAccess.Member;
+            if (lastMember.MemberType == MemberTypes.Property)
+            {
+                var set = ((PropertyInfo)lastMember).GetSetMethod(true);
+                il.Emit(OpCodes.Callvirt, set); // SET
+            }
+            else
+            {
+                il.Emit(OpCodes.Stfld, ((FieldInfo)lastMember)); // SET
+            }
+
+            il.Emit(OpCodes.Ret); // GO
+
+            setter = (Action<object, DynamicParameters>)dm.CreateDelegate(typeof(Action<object, DynamicParameters>));
+            lock (cache)
+            {
+                cache[lookup] = setter;
+            }
+
+            // Queue the preparation to be fired off when adding parameters to the DbCommand
+            MAKECALLBACK:
+            (outputCallbacks ?? (outputCallbacks = new List<Action>())).Add(() =>
+            {
+                // Finally, prep the parameter and attach the callback to it
+                ParamInfo parameter;
+                var targetMemberType = lastMemberAccess.Type;
+                int sizeToSet = (!size.HasValue && targetMemberType == typeof(string)) ? DbString.DefaultLength : size ?? 0;
+
+                if (this.parameters.TryGetValue(dynamicParamName, out parameter))
+                {
+                    parameter.ParameterDirection = parameter.AttachedParam.Direction = ParameterDirection.InputOutput;
+
+                    if (parameter.AttachedParam.Size == 0)
+                    {
+                        parameter.Size = parameter.AttachedParam.Size = sizeToSet;
+                    }
+                }
+                else
+                {
+                    SqlMapper.ITypeHandler handler;
+                    dbType = (!dbType.HasValue) ? SqlMapper.LookupDbType(targetMemberType, targetMemberType.Name, true, out handler) : dbType;
+
+                    // CameFromTemplate property would not apply here because this new param
+                    // Still needs to be added to the command
+                    this.Add(dynamicParamName, expression.Compile().Invoke(target), null, ParameterDirection.InputOutput, sizeToSet);
+                }
+
+                parameter = this.parameters[dynamicParamName];
+                parameter.OutputCallback = setter;
+                parameter.OutputTarget = target;
+            });
+
+            return this;
+        }
+
+        private List<Action> outputCallbacks;
+
+        private readonly Dictionary<string, Action<object, DynamicParameters>> cachedOutputSetters = new Dictionary<string,Action<object,DynamicParameters>>();
+
+        internal static class CachedOutputSetters<T>
+        {
+            public static readonly Hashtable Cache = new Hashtable();
+        }
+
+        void SqlMapper.IParameterCallbacks.OnCompleted()
+        {
+            foreach (var param in (from p in parameters select p.Value))
+            {
+                if (param.OutputCallback != null) param.OutputCallback(param.OutputTarget, this);
+            }
         }
     }
 
@@ -4336,6 +5172,13 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
     sealed partial class DbString : Dapper.SqlMapper.ICustomQueryParameter
     {
         /// <summary>
+        /// A value to set the default value of strings
+        /// going through Dapper. Default is 4000, any value larger than this
+        /// field will not have the default value applied.
+        /// </summary>
+        public const int DefaultLength = 4000;
+
+        /// <summary>
         /// Create a new DbString
         /// </summary>
         public DbString() { Length = -1; }
@@ -4369,9 +5212,9 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
             var param = command.CreateParameter();
             param.ParameterName = name;
             param.Value = (object)Value ?? DBNull.Value;
-            if (Length == -1 && Value != null && Value.Length <= 4000)
+            if (Length == -1 && Value != null && Value.Length <= DefaultLength)
             {
-                param.Size = 4000;
+                param.Size = DefaultLength;
             }
             else
             {
@@ -4387,33 +5230,35 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
     /// </summary>
     partial class FeatureSupport
     {
-        /// <summary>
-        /// Dictionary of supported features index by connection type name
-        /// </summary>
-        private static readonly Dictionary<string, FeatureSupport> FeatureList = new Dictionary<string, FeatureSupport>(StringComparer.InvariantCultureIgnoreCase) {
-				{"sqlserverconnection", new FeatureSupport { Arrays = false, DerivedParameters = true}},
-				{"npgsqlconnection", new FeatureSupport {Arrays = true, DerivedParameters = false}}
-		};
+        private static readonly FeatureSupport
+            @default = new FeatureSupport(false, false),
+            postgres = new FeatureSupport(true, false),
+            sqlserver = new FeatureSupport(false, true);
 
         /// <summary>
         /// Gets the featureset based on the passed connection
         /// </summary>
         public static FeatureSupport Get(IDbConnection connection)
         {
-            string name = connection.GetType().Name;
-            FeatureSupport features;
-            return FeatureList.TryGetValue(name, out features) ? features : FeatureList.Values.First();
+            string name = connection == null ? null : connection.GetType().Name;
+            if (string.Equals(name, "npgsqlconnection", StringComparison.InvariantCultureIgnoreCase)) return postgres;
+            if (string.Equals(name, "sqlconnection", StringComparison.InvariantCultureIgnoreCase)) return sqlserver;
+            return @default;
         }
-
+        private FeatureSupport(bool arrays, bool deriveParameters)
+        {
+            Arrays = arrays;
+            DerivedParameters = deriveParameters;
+        }
         /// <summary>
         /// True if the db supports array columns e.g. Postgresql
         /// </summary>
-        public bool Arrays { get; set; }
+        public bool Arrays { get; private set; }
 
         /// <summary>
         /// True if the db provider implements parameter derivation using e.g. DeriveParameters method
         /// </summary>
-        public bool DerivedParameters { get; set; }
+        public bool DerivedParameters { get; private set; }
     }
 
     /// <summary>
@@ -4619,6 +5464,22 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
         }
 
         /// <summary>
+        /// Returns the constructor, if any, that has the ExplicitConstructorAttribute on it.
+        /// </summary>
+        public ConstructorInfo FindExplicitConstructor()
+        {
+            var constructors = _type.GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            var withAttr = constructors.Where(c => c.GetCustomAttributes(typeof(ExplicitConstructorAttribute), true).Length > 0).ToList();
+
+            if (withAttr.Count == 1)
+            {
+                return withAttr[0];
+            }
+
+            return null;
+        }
+
+        /// <summary>
         /// Gets mapping for constructor parameter
         /// </summary>
         /// <param name="constructor">Constructor to resolve</param>
@@ -4641,18 +5502,36 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
             var property = _properties.FirstOrDefault(p => string.Equals(p.Name, columnName, StringComparison.Ordinal))
                ?? _properties.FirstOrDefault(p => string.Equals(p.Name, columnName, StringComparison.OrdinalIgnoreCase));
 
+            if (property == null && MatchNamesWithUnderscores)
+            {
+                property = _properties.FirstOrDefault(p => string.Equals(p.Name, columnName.Replace("_", ""), StringComparison.Ordinal))
+                    ?? _properties.FirstOrDefault(p => string.Equals(p.Name, columnName.Replace("_", ""), StringComparison.OrdinalIgnoreCase));
+            }
+
             if (property != null)
                 return new SimpleMemberMap(columnName, property);
 
             var field = _fields.FirstOrDefault(p => string.Equals(p.Name, columnName, StringComparison.Ordinal))
                ?? _fields.FirstOrDefault(p => string.Equals(p.Name, columnName, StringComparison.OrdinalIgnoreCase));
 
+            if (field == null && MatchNamesWithUnderscores)
+            {
+                field = _fields.FirstOrDefault(p => string.Equals(p.Name, columnName.Replace("_", ""), StringComparison.Ordinal))
+                    ?? _fields.FirstOrDefault(p => string.Equals(p.Name, columnName.Replace("_", ""), StringComparison.OrdinalIgnoreCase));
+            }
+
             if (field != null)
                 return new SimpleMemberMap(columnName, field);
 
             return null;
         }
+        /// <summary>
+        /// Should column names like User_Id be allowed to match properties/fields like UserId ?
+        /// </summary>
+        public static bool MatchNamesWithUnderscores { get; set; }
     }
+
+    
 
     /// <summary>
     /// Implements custom property mapping by user provided criteria (usually presence of some custom attribute with column to member mapping)
@@ -4691,6 +5570,15 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
         }
 
         /// <summary>
+        /// Always returns null
+        /// </summary>
+        /// <returns></returns>
+        public ConstructorInfo FindExplicitConstructor()
+        {
+            return null;
+        }
+
+        /// <summary>
         /// Not impelmeneted as far as default constructor used for all cases
         /// </summary>
         /// <param name="constructor"></param>
@@ -4711,6 +5599,230 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
             var prop = _propertySelector(_type, columnName);
             return prop != null ? new SimpleMemberMap(columnName, prop) : null;
         }
+    }
+
+    internal class WrappedReader : IDataReader, IWrappedDataReader
+    {
+        private IDataReader reader;
+        private IDbCommand cmd;
+
+        public IDataReader Reader
+        {
+            get
+            {
+                var tmp = reader;
+                if (tmp == null) throw new ObjectDisposedException(GetType().Name);
+                return tmp;
+            }
+        }
+        IDbCommand IWrappedDataReader.Command
+        {
+            get
+            {
+                var tmp = cmd;
+                if (tmp == null) throw new ObjectDisposedException(GetType().Name);
+                return tmp;
+            }
+        }
+        public WrappedReader(IDbCommand cmd, IDataReader reader)
+        {
+            this.cmd = cmd;
+            this.reader = reader;
+        }
+
+        void IDataReader.Close()
+        {
+            if(reader != null) reader.Close();
+        }
+
+        int IDataReader.Depth
+        {
+            get { return Reader.Depth; }
+        }
+
+        DataTable IDataReader.GetSchemaTable()
+        {
+            return Reader.GetSchemaTable();
+        }
+
+        bool IDataReader.IsClosed
+        {
+            get { return reader == null ? true : reader.IsClosed; }
+        }
+
+        bool IDataReader.NextResult()
+        {
+            return Reader.NextResult();
+        }
+
+        bool IDataReader.Read()
+        {
+            return Reader.Read();
+        }
+
+        int IDataReader.RecordsAffected
+        {
+            get { return Reader.RecordsAffected; }
+        }
+
+        void IDisposable.Dispose()
+        {
+            if (reader != null) reader.Close();
+            if (reader != null) reader.Dispose();
+            reader = null;
+            if (cmd != null) cmd.Dispose();
+            cmd = null;
+        }
+
+        int IDataRecord.FieldCount
+        {
+            get { return Reader.FieldCount; }
+        }
+
+        bool IDataRecord.GetBoolean(int i)
+        {
+            return Reader.GetBoolean(i);
+        }
+
+        byte IDataRecord.GetByte(int i)
+        {
+            return Reader.GetByte(i);
+        }
+
+        long IDataRecord.GetBytes(int i, long fieldOffset, byte[] buffer, int bufferoffset, int length)
+        {
+            return Reader.GetBytes(i, fieldOffset, buffer, bufferoffset, length);
+        }
+
+        char IDataRecord.GetChar(int i)
+        {
+            return Reader.GetChar(i);
+        }
+
+        long IDataRecord.GetChars(int i, long fieldoffset, char[] buffer, int bufferoffset, int length)
+        {
+            return Reader.GetChars(i, fieldoffset, buffer, bufferoffset, length);
+        }
+
+        IDataReader IDataRecord.GetData(int i)
+        {
+            return Reader.GetData(i);
+        }
+
+        string IDataRecord.GetDataTypeName(int i)
+        {
+            return Reader.GetDataTypeName(i);
+        }
+
+        DateTime IDataRecord.GetDateTime(int i)
+        {
+            return Reader.GetDateTime(i);
+        }
+
+        decimal IDataRecord.GetDecimal(int i)
+        {
+            return Reader.GetDecimal(i);
+        }
+
+        double IDataRecord.GetDouble(int i)
+        {
+            return Reader.GetDouble(i);
+        }
+
+        Type IDataRecord.GetFieldType(int i)
+        {
+            return Reader.GetFieldType(i);
+        }
+
+        float IDataRecord.GetFloat(int i)
+        {
+            return Reader.GetFloat(i);
+        }
+
+        Guid IDataRecord.GetGuid(int i)
+        {
+            return Reader.GetGuid(i);
+        }
+
+        short IDataRecord.GetInt16(int i)
+        {
+            return Reader.GetInt16(i);
+        }
+
+        int IDataRecord.GetInt32(int i)
+        {
+            return Reader.GetInt32(i);
+        }
+
+        long IDataRecord.GetInt64(int i)
+        {
+            return Reader.GetInt64(i);
+        }
+
+        string IDataRecord.GetName(int i)
+        {
+            return Reader.GetName(i);
+        }
+
+        int IDataRecord.GetOrdinal(string name)
+        {
+            return Reader.GetOrdinal(name);
+        }
+
+        string IDataRecord.GetString(int i)
+        {
+            return Reader.GetString(i);
+        }
+
+        object IDataRecord.GetValue(int i)
+        {
+            return Reader.GetValue(i);
+        }
+
+        int IDataRecord.GetValues(object[] values)
+        {
+            return Reader.GetValues(values);
+        }
+
+        bool IDataRecord.IsDBNull(int i)
+        {
+            return Reader.IsDBNull(i);
+        }
+
+        object IDataRecord.this[string name]
+        {
+            get { return Reader[name]; }
+        }
+
+        object IDataRecord.this[int i]
+        {
+            get { return Reader[i]; }
+        }
+    }
+
+    /// <summary>
+    /// Describes a reader that controls the lifetime of both a command and a reader,
+    /// exposing the downstream command/reader as properties.
+    /// </summary>
+    public interface IWrappedDataReader : IDataReader
+    {
+        /// <summary>
+        /// Obtain the underlying reader
+        /// </summary>
+        IDataReader Reader { get; }
+        /// <summary>
+        /// Obtain the underlying command
+        /// </summary>
+        IDbCommand Command { get; }
+    }
+
+    /// <summary>
+    /// Tell Dapper to use an explicit constructor, passing nulls or 0s for all parameters
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Constructor, AllowMultiple = false)]
+    public sealed class ExplicitConstructorAttribute : Attribute
+    {
+
     }
 
     // Define DAPPER_MAKE_PRIVATE if you reference Dapper by source
