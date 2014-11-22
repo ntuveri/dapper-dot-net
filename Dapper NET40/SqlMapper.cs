@@ -34,7 +34,7 @@ namespace Dapper
     public enum CommandFlags
     {
         /// <summary>
-        /// No additonal flags
+        /// No additional flags
         /// </summary>
         None = 0,
         /// <summary>
@@ -306,7 +306,7 @@ namespace Dapper
         }
 
         /// <summary>
-        /// Extends IDynamicParameters with facitilies for executing callbacks after commands have completed
+        /// Extends IDynamicParameters with facilities for executing callbacks after commands have completed
         /// </summary>
         public partial interface IParameterCallbacks : IDynamicParameters
         {
@@ -420,7 +420,7 @@ namespace Dapper
         }
 
         /// <summary>
-        /// Implement this interface to change default mapping of reader columns to type memebers
+        /// Implement this interface to change default mapping of reader columns to type members
         /// </summary>
         public interface ITypeMap
         {
@@ -437,7 +437,7 @@ namespace Dapper
             /// 
             /// Parameters will be default values, nulls for reference types and zero'd for value types.
             /// 
-            /// Use this class to force object creation away from parameterless constructors you dn't control.
+            /// Use this class to force object creation away from parameterless constructors you don't control.
             /// </summary>
             ConstructorInfo FindExplicitConstructor();
 
@@ -778,7 +778,7 @@ namespace Dapper
             AddTypeHandlerImpl(typeof(DataTable), new DataTableHandler(), true);
         }
         /// <summary>
-        /// Configire the specified type to be mapped to a given db-type
+        /// Configure the specified type to be mapped to a given db-type
         /// </summary>
         public static void AddTypeMap(Type type, DbType dbType)
         {
@@ -794,7 +794,7 @@ namespace Dapper
         }
 
         /// <summary>
-        /// Configire the specified type to be processed by a custom handler
+        /// Configure the specified type to be processed by a custom handler
         /// </summary>
         public static void AddTypeHandler(Type type, ITypeHandler handler)
         {
@@ -802,7 +802,7 @@ namespace Dapper
         }
 
         /// <summary>
-        /// Configire the specified type to be processed by a custom handler
+        /// Configure the specified type to be processed by a custom handler
         /// </summary>
         public static void AddTypeHandlerImpl(Type type, ITypeHandler handler, bool clone)
         {
@@ -851,7 +851,7 @@ namespace Dapper
         }
 
         /// <summary>
-        /// Configire the specified type to be processed by a custom handler
+        /// Configure the specified type to be processed by a custom handler
         /// </summary>
         public static void AddTypeHandler<T>(TypeHandler<T> handler)
         {
@@ -956,7 +956,7 @@ namespace Dapper
         }
 
         /// <summary>
-        /// Identity of a cached query in Dapper, used for extensability
+        /// Identity of a cached query in Dapper, used for extensibility
         /// </summary>
         public partial class Identity : IEquatable<Identity>
         {
@@ -1644,8 +1644,8 @@ this IDbConnection cnn, string sql, object param, IDbTransaction transaction, in
         /// <summary>
         /// Maps a query to objects
         /// </summary>
-        /// <typeparam name="TFirst">The first type in the recordset</typeparam>
-        /// <typeparam name="TSecond">The second type in the recordset</typeparam>
+        /// <typeparam name="TFirst">The first type in the record set</typeparam>
+        /// <typeparam name="TSecond">The second type in the record set</typeparam>
         /// <typeparam name="TReturn">The return type</typeparam>
         /// <param name="cnn"></param>
         /// <param name="sql"></param>
@@ -1812,7 +1812,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
         /// <typeparam name="TReturn">The return type</typeparam>
         /// <param name="cnn"></param>
         /// <param name="sql"></param>
-        /// <param name="types">array of types in the recordset</param>
+        /// <param name="types">array of types in the record set</param>
         /// <param name="map"></param>
         /// <param name="param"></param>
         /// <param name="transaction"></param>
@@ -3293,7 +3293,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                             case TypeCode.Single:
                             case TypeCode.Double:
                             case TypeCode.Decimal:
-                                // neeed to stloc, ldloca, call
+                                // need to stloc, ldloca, call
                                 // re-use existing locals (both the last known, and via a dictionary)
                                 var convert = GetToString(typeCode);
                                 if (local == null || local.LocalType != propType)
@@ -4127,7 +4127,7 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
         /// <summary>
         /// How should connection strings be compared for equivalence? Defaults to StringComparer.Ordinal.
         /// Providing a custom implementation can be useful for allowing multi-tenancy databases with identical
-        /// schema to share startegies. Note that usual equivalence rules apply: any equivalent connection strings
+        /// schema to share strategies. Note that usual equivalence rules apply: any equivalent connection strings
         /// <b>MUST</b> yield the same hash-code.
         /// </summary>
         public static IEqualityComparer<string> ConnectionStringComparer
@@ -4247,7 +4247,7 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
 
 #if CSHARP30
             /// <summary>
-            /// Read multiple objects from a single recordset on the grid
+            /// Read multiple objects from a single record set on the grid
             /// </summary>
             public IEnumerable<TReturn> Read<TFirst, TSecond, TReturn>(Func<TFirst, TSecond, TReturn> func, string splitOn)
             {
@@ -4255,7 +4255,7 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
             }
 #endif
             /// <summary>
-            /// Read multiple objects from a single recordset on the grid
+            /// Read multiple objects from a single record set on the grid
             /// </summary>
 #if CSHARP30
             public IEnumerable<TReturn> Read<TFirst, TSecond, TReturn>(Func<TFirst, TSecond, TReturn> func, string splitOn, bool buffered)
@@ -4269,7 +4269,7 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
 
 #if CSHARP30
             /// <summary>
-            /// Read multiple objects from a single recordset on the grid
+            /// Read multiple objects from a single record set on the grid
             /// </summary>
             public IEnumerable<TReturn> Read<TFirst, TSecond, TThird, TReturn>(Func<TFirst, TSecond, TThird, TReturn> func, string splitOn)
             {
@@ -4277,7 +4277,7 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
             }
 #endif
             /// <summary>
-            /// Read multiple objects from a single recordset on the grid
+            /// Read multiple objects from a single record set on the grid
             /// </summary>
 #if CSHARP30
             public IEnumerable<TReturn> Read<TFirst, TSecond, TThird, TReturn>(Func<TFirst, TSecond, TThird, TReturn> func, string splitOn, bool buffered)
@@ -5236,7 +5236,7 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
             sqlserver = new FeatureSupport(false, true);
 
         /// <summary>
-        /// Gets the featureset based on the passed connection
+        /// Gets the feature set based on the passed connection
         /// </summary>
         public static FeatureSupport Get(IDbConnection connection)
         {
@@ -5262,7 +5262,7 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
     }
 
     /// <summary>
-    /// Represents simple memeber map for one of target parameter or property or field to source DataReader column
+    /// Represents simple member map for one of target parameter or property or field to source DataReader column
     /// </summary>
     sealed partial class SimpleMemberMap : SqlMapper.IMemberMap
     {
@@ -5579,7 +5579,7 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
         }
 
         /// <summary>
-        /// Not impelmeneted as far as default constructor used for all cases
+        /// Not implemented as far as default constructor used for all cases
         /// </summary>
         /// <param name="constructor"></param>
         /// <param name="columnName"></param>
