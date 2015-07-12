@@ -174,7 +174,7 @@ The performance tests are broken in to 3 lists:
 		<td rowspan="3">&nbsp;</td>
 	</tr>
 	<tr>
-		<td><a href="http://blog.wekeroad.com/helpy-stuff/and-i-shall-call-it-massive">Massive</a></td>
+		<td><a href="https://github.com/robconery/massive">Massive</a></td>
 		<td>52ms</td>
 	</tr>
 	<tr>
@@ -305,7 +305,7 @@ Dapper supports fully stored procs:
 
 ```csharp
 var user = cnn.Query<User>("spGetUser", new {Id = 1}, 
-        commandType: CommandType.StoredProcedure).First();}}}
+        commandType: CommandType.StoredProcedure).SingleOrDefault();
 ```
 
 If you want something more fancy, you can do:
@@ -316,7 +316,7 @@ p.Add("@a", 11);
 p.Add("@b", dbType: DbType.Int32, direction: ParameterDirection.Output);
 p.Add("@c", dbType: DbType.Int32, direction: ParameterDirection.ReturnValue);
 
-cnn.Execute("spMagicProc", p, commandType: commandType.StoredProcedure); 
+cnn.Execute("spMagicProc", p, commandType: CommandType.StoredProcedure); 
 
 int b = p.Get<int>("@b");
 int c = p.Get<int>("@c"); 

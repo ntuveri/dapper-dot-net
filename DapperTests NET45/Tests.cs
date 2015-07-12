@@ -1,4 +1,5 @@
-﻿using System.Linq;
+﻿#if ASYNC
+using System.Linq;
 using Dapper;
 using SqlMapper;
 using System.Data;
@@ -7,6 +8,14 @@ using System;
 using System.Threading.Tasks;
 using System.Threading;
 using System.Data.SqlClient;
+
+#if DNXCORE50
+using IDbCommand = global::System.Data.Common.DbCommand;
+using IDbDataParameter = global::System.Data.Common.DbParameter;
+using IDbConnection = global::System.Data.Common.DbConnection;
+using IDbTransaction = global::System.Data.Common.DbTransaction;
+using IDataReader = global::System.Data.Common.DbDataReader;
+#endif
 
 namespace DapperTests_NET45
 {
@@ -180,7 +189,7 @@ namespace DapperTests_NET45
                 }
             }
         }
-
+#if EXTERNALS
         public void ExecuteReaderOpenAsync()
         {
             using (var conn = Program.GetOpenConnection())
@@ -209,6 +218,7 @@ namespace DapperTests_NET45
                 ((int)dt.Rows[0][1]).IsEqualTo(4);
             }
         }
+#endif
 
         public void LiteralReplacementOpen()
         {
@@ -308,6 +318,34 @@ namespace DapperTests_NET45
                 watch.Stop();
                 System.Console.WriteLine("Pipeline: {0}ms", watch.ElapsedMilliseconds);
             }
+        }
+
+        public void AssertNoCacheWorksForQueryMultiple()
+        {
+            int a = 123, b = 456;
+            var cmdDef = new CommandDefinition(@"select @a; select @b;", new
+            {
+                a, b
+            }, commandType: CommandType.Text, flags: CommandFlags.NoCache);
+
+            int c, d;
+            Dapper.SqlMapper.PurgeQueryCache();
+            int before = Dapper.SqlMapper.GetCachedSQLCount();
+            using (var sqlConnection = Program.GetOpenConnection(true))
+            {
+                using (var multi = sqlConnection.QueryMultiple(cmdDef))
+                {
+                    c = multi.Read<int>().Single();
+                    d = multi.Read<int>().Single();
+                }
+            }
+            int after = Dapper.SqlMapper.GetCachedSQLCount();
+            before.IsEqualTo(0);
+            after.IsEqualTo(0);
+            c.IsEqualTo(123);
+            d.IsEqualTo(456);
+
+
         }
         class Product
         {
@@ -738,3 +776,4 @@ SET @AddressPersonId = @PersonId", p).Result)
         }
     }
 }
+#endif
